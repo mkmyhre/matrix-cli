@@ -5,9 +5,20 @@ regular subcommands, and live terminal modes.
 
 ## Install
 
+Using the Makefile:
+
+```sh
+make install
+```
+
+Or directly with Go:
+
 ```sh
 go install -tags goolm ./cmd/matrix
 ```
+
+Both commands install to `GOBIN`, or `$(go env GOPATH)/bin` when `GOBIN` is
+unset. Run `make build` instead to create `./matrix` in the repository.
 
 The `goolm` build tag enables the pure-Go end-to-end encryption implementation.
 A build without that tag still works for unencrypted rooms, but `matrix verify`
@@ -24,9 +35,44 @@ go build -tags goolm -o matrix ./cmd/matrix
 
 ## Login
 
-The authentication URL may differ from the Synapse/client API URL. This supports
-Matrix Authentication Service deployments that expose `m.login.password` at the
-standard Matrix login path.
+### Matrix.org account
+
+To add an existing `@alice:matrix.org` account under the local name `personal`,
+use the Matrix.org client endpoint and enter the account password when prompted:
+
+```sh
+matrix accounts add personal \
+  --homeserver https://matrix-client.matrix.org \
+  --server-name matrix.org \
+  --username alice
+```
+
+The name `personal` is only a local selector; it does not create a new Matrix
+account. Use this account on every later command:
+
+```sh
+matrix --ac personal rooms
+matrix --ac personal tui
+matrix --ac personal send '#room:matrix.org' 'hello'
+```
+
+Matrix.org currently offers password login, which this example uses. Do not put
+the password on the command line. The prompt does not echo it. Accounts that use
+browser SSO can use `--sso` as described below.
+
+### Other homeservers
+
+For a normal password-based homeserver:
+
+```sh
+matrix login \
+  --homeserver https://matrix.example.com \
+  --username alice
+```
+
+`--auth-url` defaults to `--homeserver`. Set it only when authentication is
+served from a different base URL, such as some Matrix Authentication Service
+(MAS) deployments:
 
 ```sh
 matrix login \
@@ -36,52 +82,98 @@ matrix login \
   --username alice
 ```
 
+The password can alternatively be supplied through `MATRIX_PASSWORD`, which is
+useful for non-interactive use but may expose it to the process environment.
+
+### Browser SSO (Keycloak, Okta, and other providers)
+
+Use the standard Matrix SSO flow for an account authenticated by an external
+identity provider:
+
+```sh
+matrix accounts add work \
+  --homeserver https://matrix.work.example \
+  --server-name work.example \
+  --sso
+```
+
+The CLI auto-detects both Matrix `m.login.sso` and delegated Matrix OAuth/MAS.
+For legacy SSO it exchanges the one-time Matrix login token. For delegated OAuth
+it discovers the issuer from `/.well-known/matrix/client`, dynamically registers
+a native client, and uses authorization code flow with PKCE. Both flows start a
+temporary callback listener on `127.0.0.1`, print the login URL, and attempt to
+open it in the default browser. Tokens returned to the callback are never
+printed.
+
+This is not tied to Keycloak: identity-provider configuration belongs to the
+homeserver or its delegated authentication service. If a legacy SSO homeserver
+advertises multiple providers, it normally shows a chooser. To select one
+directly, use the provider ID advertised by the Matrix login endpoint:
+
+```sh
+curl -s https://matrix.work.example/_matrix/client/v3/login | jq '.flows[] | select(.type == "m.login.sso")'
+matrix accounts add work \
+  --homeserver https://matrix.work.example \
+  --server-name work.example \
+  --sso --idp keycloak
+```
+
+`--idp` applies to legacy `m.login.sso`; delegated OAuth services choose their
+upstream provider themselves. It is harmless if supplied while delegated OAuth
+is auto-detected. `--username` and `--password` are not needed with `--sso`.
+The callback is bound only to loopback and protected by a random path and OAuth
+state; delegated OAuth also uses PKCE. Login times out after five minutes. On a
+remote/headless machine, the printed URL is still provided, but the browser must
+be able to reach that machine's loopback callback (for example, through an
+appropriate SSH forwarding setup).
+
 ## Multiple accounts
 
-Accounts can point to different homeservers. `default` remains the account used
-when no option is supplied, so existing installations continue to work.
-Create named accounts either with `accounts add`:
+Accounts can point to different homeservers. `default` is used when `--ac` is
+omitted. Add a named account with:
 
 ```sh
 matrix accounts add work \
   --homeserver https://matrix.work.example \
   --username alice
-matrix accounts add personal \
-  --homeserver https://matrix.example.org \
+```
+
+The equivalent form is:
+
+```sh
+matrix --ac work login \
+  --homeserver https://matrix.work.example \
   --username alice
 ```
 
-or by selecting a name while logging in:
-
-```sh
-matrix --ac work login --homeserver https://matrix.work.example --username alice
-```
-
-List and use them with:
+List and select accounts with:
 
 ```sh
 matrix accounts
 matrix --ac default rooms
 matrix --ac work tui
-matrix --ac personal send '#general:example.org' 'hello'
+matrix --ac personal send '#general:matrix.org' 'hello'
 ```
 
-`--account` is also accepted as the long-form alias of `--ac`. Logging out only
-removes the selected account (`matrix --ac work logout`). Account names may
-contain letters, numbers, `.`, `-`, and `_`.
+`--account` is the long-form alias for `--ac`. Account names may contain letters,
+numbers, `.`, `-`, and `_`. Login, encryption state, and keybindings are kept
+separate for each account. Logging out affects only the selected account:
 
-The password is read without echo. It can also be supplied through
-`MATRIX_PASSWORD`. Session tokens are stored in the operating-system keyring.
-If no keyring service is available (common in headless Linux development), the
-client falls back to `session.json` in its user config directory with mode
-`0600`. Non-secret connection metadata is stored separately in `config.json`.
+```sh
+matrix --ac work logout
+```
+
+Session tokens are stored in the operating-system keyring. If no keyring service
+is available (common on headless Linux), the client falls back to a
+user-readable-only `session.json` (`0600`) in its config directory. Non-secret
+connection metadata is stored separately in `config.json`.
 
 ## Commands
 
 ```text
 matrix login
 matrix accounts
-matrix accounts add <name>
+matrix accounts add <name> [--sso [--idp <provider-id>]]
 matrix [--ac <name>] logout
 matrix [--ac <name>] verify
 matrix rooms
@@ -127,25 +219,39 @@ initial sync. Chat initially loads 30 recent messages and paginates backward in
 
 ## Encrypted rooms and device verification
 
-After logging in with a `goolm` build, verify the new device against Element or
-another already trusted Matrix client:
+Encryption support is selected **at build time**. Confirm that the installed
+binary was built with the `goolm` tag (see [Install](#install)); an untagged
+build cannot read or send encrypted room messages.
+
+Each newly logged-in account is a new Matrix device. After adding an encrypted
+account, verify that device using Element or another already trusted client. For
+the `personal` example above:
 
 ```sh
-matrix --ac default verify
+matrix --ac personal verify
 ```
 
-Approve the request in the other client, compare the displayed emoji, then type
-`y` only when they match. Crypto state is stored per account in a protected
-SQLite database. Encrypted text, notice, emote, and thread messages can then be
-sent and received. Logging in again or logging out resets that account's local
-crypto store because Matrix encryption keys are tied to a specific device.
+1. Keep the command running.
+2. Approve the verification request in the trusted client.
+3. Compare the emoji shown by both clients.
+4. Type `y` only if every emoji matches.
 
-This initial E2EE support does not yet restore historical keys from server-side
-key backup, so older messages whose keys were never shared with this device may
-not be available. Browser-based OIDC login is also deferred.
+You can then use `matrix --ac personal tui`, `chat`, `watch`, and `send` in
+encrypted rooms. Crypto state is stored in a protected SQLite database per
+account, separate from every other account.
 
-The client validates the saved token with the homeserver before opening the
-crypto store. If it reports that the session is no longer valid, log in again.
-For local or containerized homeservers, make sure the server database is on a
-persistent volume: restarting an ephemeral homeserver invalidates every saved
-token and device, and the old local encryption store cannot be reused.
+Important limitations:
+
+- Server-side key backup restore is not implemented. Old encrypted messages may
+  remain unreadable unless another device shares their room keys.
+- Matrix `m.login.sso` and delegated Matrix OAuth/MAS browser login are
+  supported. Generic OIDC issuers must be advertised by a Matrix homeserver;
+  arbitrary direct OIDC login is intentionally not supported.
+- Logging in again creates a new Matrix device and resets that account's local
+  crypto store. Verify the new device again.
+- Logging out also removes that account's local crypto store.
+
+The client validates a saved token before opening the crypto store. If it says
+the session is no longer valid, log in again. For local/containerized servers,
+persist the homeserver database: recreating it invalidates saved tokens and
+Matrix device state.

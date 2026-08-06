@@ -26,11 +26,12 @@ import (
 type MatrixFactory func(config.Config, auth.Credentials) (matrix.API, error)
 
 type App struct {
-	Config    config.Store
-	Session   session.Store
-	HTTP      *http.Client
-	NewMatrix MatrixFactory
-	Now       func() time.Time
+	Config      config.Store
+	Session     session.Store
+	HTTP        *http.Client
+	NewMatrix   MatrixFactory
+	Now         func() time.Time
+	OpenBrowser func(string) error
 
 	// Account hooks are set by NewDefault. Leaving them nil preserves the
 	// simple single-account setup used by embedders and tests.
@@ -126,7 +127,8 @@ func (a *App) loginCommand() *cobra.Command {
 }
 
 func (a *App) newLoginCommand(use string, accountArgument bool) *cobra.Command {
-	var homeserver, authURL, serverName, username, password string
+	var homeserver, authURL, serverName, username, password, identityProvider string
+	var useSSO bool
 	cmd := &cobra.Command{
 		Use:   use,
 		Short: "Authenticate and store a Matrix session",
@@ -148,23 +150,42 @@ func (a *App) newLoginCommand(use string, accountArgument bool) *cobra.Command {
 			if authURL == "" {
 				authURL = homeserver
 			}
-			if username == "" {
-				return errors.New("--username is required")
+			if identityProvider != "" && !useSSO {
+				return errors.New("--idp requires --sso")
 			}
-			if password == "" {
-				password = os.Getenv("MATRIX_PASSWORD")
+			if useSSO && cmd.Flags().Changed("password") {
+				return errors.New("--password cannot be used with --sso")
 			}
-			if password == "" {
-				var err error
-				password, err = readPassword(cmd.ErrOrStderr(), os.Stdin)
-				if err != nil {
-					return err
+			var creds auth.Credentials
+			var err error
+			if useSSO {
+				authenticator := auth.SSOAuthenticator{
+					BaseURL: authURL, HomeserverURL: homeserver, Client: a.HTTP, Now: a.Now,
+					DeviceName:  "matrix-cli (" + a.Account + ")",
+					OpenBrowser: a.OpenBrowser, Output: cmd.ErrOrStderr(),
 				}
+				creds, err = authenticator.Login(cmd.Context(), identityProvider)
+			} else {
+				if username == "" {
+					return errors.New("--username is required unless --sso is used")
+				}
+				if password == "" {
+					password = os.Getenv("MATRIX_PASSWORD")
+				}
+				if password == "" {
+					password, err = readPassword(cmd.ErrOrStderr(), os.Stdin)
+					if err != nil {
+						return err
+					}
+				}
+				authenticator := auth.PasswordAuthenticator{BaseURL: authURL, Client: a.HTTP, Now: a.Now, DeviceName: "matrix-cli (" + a.Account + ")"}
+				creds, err = authenticator.Login(cmd.Context(), username, password)
 			}
-			authenticator := auth.PasswordAuthenticator{BaseURL: authURL, Client: a.HTTP, Now: a.Now, DeviceName: "matrix-cli (" + a.Account + ")"}
-			creds, err := authenticator.Login(cmd.Context(), username, password)
 			if err != nil {
 				return err
+			}
+			if username == "" {
+				username = creds.UserID
 			}
 			loginClient, err := matrix.New(homeserver, creds.UserID, creds.DeviceID, creds.AccessToken)
 			if err != nil {
@@ -200,8 +221,10 @@ func (a *App) newLoginCommand(use string, accountArgument bool) *cobra.Command {
 	cmd.Flags().StringVar(&homeserver, "homeserver", "", "Synapse/client API base URL")
 	cmd.Flags().StringVar(&authURL, "auth-url", "", "authentication base URL (defaults to homeserver)")
 	cmd.Flags().StringVar(&serverName, "server-name", "", "Matrix server name/ID domain")
-	cmd.Flags().StringVarP(&username, "username", "u", "", "Matrix username")
+	cmd.Flags().StringVarP(&username, "username", "u", "", "Matrix username (not needed with --sso)")
 	cmd.Flags().StringVar(&password, "password", "", "password (prefer MATRIX_PASSWORD or the prompt)")
+	cmd.Flags().BoolVar(&useSSO, "sso", false, "sign in through the homeserver's browser SSO flow")
+	cmd.Flags().StringVar(&identityProvider, "idp", "", "SSO identity provider ID advertised by the homeserver")
 	return cmd
 }
 
@@ -272,11 +295,19 @@ func mergeRefreshedCredentials(previous, refreshed auth.Credentials) auth.Creden
 	// The pickle key is local storage state, not an authentication-server
 	// credential, so a refresh response can never replace it.
 	refreshed.CryptoPickleKey = previous.CryptoPickleKey
+	refreshed.OAuthClientID = previous.OAuthClientID
+	refreshed.OAuthTokenEndpoint = previous.OAuthTokenEndpoint
 	return refreshed
 }
 
 func (a *App) refreshCredentials(ctx context.Context, cfg config.Config, creds auth.Credentials) (auth.Credentials, error) {
-	refreshed, err := (auth.PasswordAuthenticator{BaseURL: cfg.AuthURL, Client: a.HTTP, Now: a.Now}).Refresh(ctx, creds.RefreshToken)
+	var refreshed auth.Credentials
+	var err error
+	if creds.OAuthTokenEndpoint != "" {
+		refreshed, err = auth.RefreshOAuth(ctx, a.HTTP, a.Now, creds)
+	} else {
+		refreshed, err = (auth.PasswordAuthenticator{BaseURL: cfg.AuthURL, Client: a.HTTP, Now: a.Now}).Refresh(ctx, creds.RefreshToken)
+	}
 	if err != nil {
 		return auth.Credentials{}, err
 	}

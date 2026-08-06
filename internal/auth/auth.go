@@ -13,12 +13,14 @@ import (
 
 // Credentials are the result of a Matrix login. They must be kept in secret storage.
 type Credentials struct {
-	AccessToken     string    `json:"access_token"`
-	RefreshToken    string    `json:"refresh_token,omitempty"`
-	UserID          string    `json:"user_id"`
-	DeviceID        string    `json:"device_id,omitempty"`
-	ExpiresAt       time.Time `json:"expires_at,omitempty"`
-	CryptoPickleKey string    `json:"crypto_pickle_key,omitempty"`
+	AccessToken        string    `json:"access_token"`
+	RefreshToken       string    `json:"refresh_token,omitempty"`
+	UserID             string    `json:"user_id"`
+	DeviceID           string    `json:"device_id,omitempty"`
+	ExpiresAt          time.Time `json:"expires_at,omitempty"`
+	CryptoPickleKey    string    `json:"crypto_pickle_key,omitempty"`
+	OAuthClientID      string    `json:"oauth_client_id,omitempty"`
+	OAuthTokenEndpoint string    `json:"oauth_token_endpoint,omitempty"`
 }
 
 func (c Credentials) Valid() bool { return c.AccessToken != "" && c.UserID != "" }

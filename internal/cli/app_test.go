@@ -137,10 +137,26 @@ func TestSendRequiresMessage(t *testing.T) {
 	}
 }
 
+func TestSSOLoginRejectsPasswordFlag(t *testing.T) {
+	root := testApp(&fakeMatrix{}).Root()
+	root.SetArgs([]string{"login", "--homeserver", "https://hs", "--sso", "--password", "secret"})
+	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), "cannot be used with --sso") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestLoginIDPRequiresSSO(t *testing.T) {
+	root := testApp(&fakeMatrix{}).Root()
+	root.SetArgs([]string{"login", "--homeserver", "https://hs", "--idp", "work"})
+	if err := root.Execute(); err == nil || !strings.Contains(err.Error(), "--idp requires --sso") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestMergeRefreshedCredentialsPreservesDeviceState(t *testing.T) {
-	previous := auth.Credentials{AccessToken: "old", RefreshToken: "refresh", UserID: "@alice:test", DeviceID: "DEV", CryptoPickleKey: "pickle"}
+	previous := auth.Credentials{AccessToken: "old", RefreshToken: "refresh", UserID: "@alice:test", DeviceID: "DEV", CryptoPickleKey: "pickle", OAuthClientID: "client", OAuthTokenEndpoint: "https://auth/token"}
 	got := mergeRefreshedCredentials(previous, auth.Credentials{AccessToken: "new"})
-	if got.AccessToken != "new" || got.RefreshToken != "refresh" || got.UserID != "@alice:test" || got.DeviceID != "DEV" || got.CryptoPickleKey != "pickle" {
+	if got.AccessToken != "new" || got.RefreshToken != "refresh" || got.UserID != "@alice:test" || got.DeviceID != "DEV" || got.CryptoPickleKey != "pickle" || got.OAuthClientID != "client" || got.OAuthTokenEndpoint != "https://auth/token" {
 		t.Fatalf("merged credentials = %#v", got)
 	}
 }
