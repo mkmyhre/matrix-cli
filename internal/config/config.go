@@ -1,0 +1,174 @@
+package config
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+)
+
+// Config contains non-secret connection metadata. Tokens are stored separately.
+type Config struct {
+	HomeserverURL string            `json:"homeserver_url"`
+	AuthURL       string            `json:"auth_url"`
+	ServerName    string            `json:"server_name,omitempty"`
+	Username      string            `json:"username"`
+	Keybindings   map[string]string `json:"keybindings,omitempty"`
+}
+
+var DefaultKeybindings = map[string]string{
+	"help":               "?",
+	"insert_mode":        "i",
+	"load_older":         "ctrl+u",
+	"normal_mode":        "esc",
+	"move_down":          "j",
+	"move_up":            "k",
+	"open_thread":        "enter",
+	"close_thread":       "esc",
+	"toggle_identifiers": "n",
+	"quit":               "q",
+	"send":               "enter",
+}
+
+func (c Config) Key(action string) string {
+	if key := c.Keybindings[action]; key != "" {
+		return key
+	}
+	return DefaultKeybindings[action]
+}
+
+func ValidKeyAction(action string) bool {
+	_, ok := DefaultKeybindings[action]
+	return ok
+}
+
+func (c Config) Validate() error {
+	if strings.TrimSpace(c.HomeserverURL) == "" {
+		return errors.New("homeserver URL is required")
+	}
+	if strings.TrimSpace(c.AuthURL) == "" {
+		return errors.New("authentication URL is required")
+	}
+	if strings.TrimSpace(c.Username) == "" {
+		return errors.New("username is required")
+	}
+	return nil
+}
+
+type Store interface {
+	Load() (Config, error)
+	Save(Config) error
+	Delete() error
+}
+
+type FileStore struct{ Path string }
+
+func DefaultPath() (string, error) {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return "", fmt.Errorf("find config directory: %w", err)
+	}
+	return filepath.Join(dir, "matrix-cli", "config.json"), nil
+}
+
+// ValidateAccountName keeps account names safe to use as directory and keyring
+// identifiers while still allowing convenient names such as "work-main".
+func ValidateAccountName(name string) error {
+	if name == "" {
+		return errors.New("account name is required")
+	}
+	if name == "." || name == ".." {
+		return fmt.Errorf("invalid account name %q", name)
+	}
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' {
+			continue
+		}
+		return fmt.Errorf("invalid account name %q (use letters, numbers, '.', '-' or '_')", name)
+	}
+	return nil
+}
+
+// AccountPath returns the config path for an account. The default account uses
+// the original path for backwards compatibility with existing installations.
+func AccountPath(defaultPath, name string) (string, error) {
+	if err := ValidateAccountName(name); err != nil {
+		return "", err
+	}
+	if name == "default" {
+		return defaultPath, nil
+	}
+	return filepath.Join(filepath.Dir(defaultPath), "accounts", name, "config.json"), nil
+}
+
+// ListAccounts lists accounts that have a saved config.
+func ListAccounts(defaultPath string) ([]string, error) {
+	var names []string
+	if _, err := os.Stat(defaultPath); err == nil {
+		names = append(names, "default")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+
+	entries, err := os.ReadDir(filepath.Join(filepath.Dir(defaultPath), "accounts"))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return names, nil
+		}
+		return nil, err
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || ValidateAccountName(entry.Name()) != nil {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(filepath.Dir(defaultPath), "accounts", entry.Name(), "config.json")); err == nil {
+			names = append(names, entry.Name())
+		}
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+func (s FileStore) Load() (Config, error) {
+	raw, err := os.ReadFile(s.Path)
+	if err != nil {
+		return Config{}, err
+	}
+	var cfg Config
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return Config{}, fmt.Errorf("decode config: %w", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		return Config{}, fmt.Errorf("invalid config: %w", err)
+	}
+	return cfg, nil
+}
+
+func (s FileStore) Save(cfg Config) error {
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
+	raw, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(s.Path), 0o700); err != nil {
+		return fmt.Errorf("create config directory: %w", err)
+	}
+	if err := os.WriteFile(s.Path, append(raw, '\n'), 0o600); err != nil {
+		return fmt.Errorf("write config: %w", err)
+	}
+	return os.Chmod(s.Path, 0o600)
+}
+
+func (s FileStore) Delete() error {
+	err := os.Remove(s.Path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
