@@ -11,26 +11,43 @@ import (
 )
 
 // Config contains non-secret connection metadata. Tokens are stored separately.
+const (
+	ThreadViewFocused  = "focused"
+	ThreadViewSplit    = "split"
+	AuthMethodPassword = "password"
+	AuthMethodSSO      = "sso"
+	ThemeMinimal       = "minimal"
+	ThemeBoxed         = "boxed"
+)
+
 type Config struct {
 	HomeserverURL string            `json:"homeserver_url"`
 	AuthURL       string            `json:"auth_url"`
 	ServerName    string            `json:"server_name,omitempty"`
 	Username      string            `json:"username"`
+	AuthMethod    string            `json:"auth_method,omitempty"`
+	SSOIDP        string            `json:"sso_idp,omitempty"`
+	ThreadView    string            `json:"thread_view,omitempty"`
+	Color         string            `json:"color,omitempty"`
+	Theme         string            `json:"theme,omitempty"`
 	Keybindings   map[string]string `json:"keybindings,omitempty"`
 }
 
 var DefaultKeybindings = map[string]string{
-	"help":               "?",
-	"insert_mode":        "i",
-	"load_older":         "ctrl+u",
-	"normal_mode":        "esc",
-	"move_down":          "j",
-	"move_up":            "k",
-	"open_thread":        "enter",
-	"close_thread":       "esc",
-	"toggle_identifiers": "n",
-	"quit":               "q",
-	"send":               "enter",
+	"help":                "?",
+	"insert_mode":         "i",
+	"load_older":          "ctrl+u",
+	"normal_mode":         "esc",
+	"move_down":           "j",
+	"move_up":             "k",
+	"open_thread":         "enter",
+	"close_thread":        "esc",
+	"switch_account":      "a",
+	"set_default_account": "d",
+	"notifications":       "n",
+	"toggle_identifiers":  "v",
+	"quit":                "q",
+	"send":                "enter",
 }
 
 func (c Config) Key(action string) string {
@@ -45,6 +62,35 @@ func ValidKeyAction(action string) bool {
 	return ok
 }
 
+func ValidAccountColor(color string) bool {
+	if color == "" {
+		return true
+	}
+	if len(color) != 7 || color[0] != '#' {
+		return false
+	}
+	for _, char := range color[1:] {
+		if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f') || (char >= 'A' && char <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+func (c Config) EffectiveTheme() string {
+	if c.Theme == ThemeBoxed {
+		return ThemeBoxed
+	}
+	return ThemeMinimal
+}
+
+func (c Config) EffectiveThreadView() string {
+	if c.ThreadView == ThreadViewSplit {
+		return ThreadViewSplit
+	}
+	return ThreadViewFocused
+}
+
 func (c Config) Validate() error {
 	if strings.TrimSpace(c.HomeserverURL) == "" {
 		return errors.New("homeserver URL is required")
@@ -54,6 +100,18 @@ func (c Config) Validate() error {
 	}
 	if strings.TrimSpace(c.Username) == "" {
 		return errors.New("username is required")
+	}
+	if c.AuthMethod != "" && c.AuthMethod != AuthMethodPassword && c.AuthMethod != AuthMethodSSO {
+		return fmt.Errorf("invalid authentication method %q", c.AuthMethod)
+	}
+	if c.ThreadView != "" && c.ThreadView != ThreadViewFocused && c.ThreadView != ThreadViewSplit {
+		return fmt.Errorf("invalid thread view %q (use %q or %q)", c.ThreadView, ThreadViewFocused, ThreadViewSplit)
+	}
+	if !ValidAccountColor(c.Color) {
+		return fmt.Errorf("invalid account color %q (use #RRGGBB)", c.Color)
+	}
+	if c.Theme != "" && c.Theme != ThemeMinimal && c.Theme != ThemeBoxed {
+		return fmt.Errorf("invalid theme %q (use %q or %q)", c.Theme, ThemeMinimal, ThemeBoxed)
 	}
 	return nil
 }

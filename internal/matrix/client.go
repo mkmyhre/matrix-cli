@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"maunium.net/go/mautrix"
@@ -108,13 +110,66 @@ func (c *Client) Rooms(ctx context.Context) ([]Room, error) {
 	if err != nil {
 		return nil, err
 	}
-	rooms := make([]Room, 0, len(resp.JoinedRooms))
-	for _, roomID := range resp.JoinedRooms {
-		var content event.RoomNameEventContent
-		_ = c.raw.StateEvent(ctx, roomID, event.StateRoomName, "", &content)
-		rooms = append(rooms, Room{ID: roomID.String(), Name: content.Name})
+	rooms := make([]Room, len(resp.JoinedRooms))
+	semaphore := make(chan struct{}, 8)
+	var workers sync.WaitGroup
+	for i, roomID := range resp.JoinedRooms {
+		i, roomID := i, roomID
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			select {
+			case semaphore <- struct{}{}:
+				defer func() { <-semaphore }()
+			case <-ctx.Done():
+				return
+			}
+			var content event.RoomNameEventContent
+			_ = c.raw.StateEvent(ctx, roomID, event.StateRoomName, "", &content)
+			name := content.Name
+			if name == "" {
+				name, _ = c.memberBasedRoomName(ctx, roomID)
+			}
+			rooms[i] = Room{ID: roomID.String(), Name: name}
+		}()
+	}
+	workers.Wait()
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return rooms, nil
+}
+
+// memberBasedRoomName implements the useful part of Matrix's calculated room
+// name algorithm for unnamed direct messages and small group rooms.
+func (c *Client) memberBasedRoomName(ctx context.Context, roomID id.RoomID) (string, error) {
+	resp, err := c.raw.JoinedMembers(ctx, roomID)
+	if err != nil {
+		return "", err
+	}
+	names := make([]string, 0, len(resp.Joined))
+	for userID, member := range resp.Joined {
+		if userID == c.raw.UserID {
+			continue
+		}
+		name := strings.TrimSpace(member.DisplayName)
+		if name == "" {
+			name = strings.TrimPrefix(userID.String(), "@")
+			if localpart, _, ok := strings.Cut(name, ":"); ok {
+				name = localpart
+			}
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	switch len(names) {
+	case 0:
+		return "", nil
+	case 1, 2, 3:
+		return strings.Join(names, ", "), nil
+	default:
+		return fmt.Sprintf("%s, %s and %d others", names[0], names[1], len(names)-2), nil
+	}
 }
 
 func (c *Client) Spaces(ctx context.Context) ([]Space, error) {
@@ -122,51 +177,86 @@ func (c *Client) Spaces(ctx context.Context) ([]Space, error) {
 	if err != nil {
 		return nil, err
 	}
-	spaces := make([]Space, 0)
+	joinedIDs := make(map[string]bool, len(joined.JoinedRooms))
 	for _, roomID := range joined.JoinedRooms {
-		var create event.CreateEventContent
-		if err := c.raw.StateEvent(ctx, roomID, event.StateCreate, "", &create); err != nil || create.Type != event.RoomTypeSpace {
-			continue
-		}
-		var name event.RoomNameEventContent
-		_ = c.raw.StateEvent(ctx, roomID, event.StateRoomName, "", &name)
-		space := Space{ID: roomID.String(), Name: name.Name}
-		from := ""
-		directIDs := make([]string, 0)
-		roomDetails := make(map[string]Room)
-		for {
-			resp, err := c.raw.Hierarchy(ctx, roomID, &mautrix.ReqHierarchy{From: from, Limit: 100})
-			if err != nil {
-				return nil, fmt.Errorf("get hierarchy for %s: %w", roomID, err)
+		joinedIDs[roomID.String()] = true
+	}
+	type spaceResult struct {
+		space *Space
+		err   error
+	}
+	results := make([]spaceResult, len(joined.JoinedRooms))
+	semaphore := make(chan struct{}, 8)
+	var workers sync.WaitGroup
+	for i, roomID := range joined.JoinedRooms {
+		i, roomID := i, roomID
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			select {
+			case semaphore <- struct{}{}:
+				defer func() { <-semaphore }()
+			case <-ctx.Done():
+				return
 			}
-			for _, child := range resp.Rooms {
-				roomDetails[child.RoomID.String()] = Room{ID: child.RoomID.String(), Name: child.Name}
-				if child.RoomID == roomID {
-					for _, relation := range child.ChildrenState {
-						if relation.Type == event.StateSpaceChild && relation.GetStateKey() != "" {
-							directIDs = append(directIDs, relation.GetStateKey())
+			var create event.CreateEventContent
+			if err := c.raw.StateEvent(ctx, roomID, event.StateCreate, "", &create); err != nil || create.Type != event.RoomTypeSpace {
+				return
+			}
+			var name event.RoomNameEventContent
+			_ = c.raw.StateEvent(ctx, roomID, event.StateRoomName, "", &name)
+			space := Space{ID: roomID.String(), Name: name.Name}
+			from := ""
+			directIDs := make([]string, 0)
+			roomDetails := make(map[string]Room)
+			for {
+				resp, err := c.raw.Hierarchy(ctx, roomID, &mautrix.ReqHierarchy{From: from, Limit: 100})
+				if err != nil {
+					results[i].err = fmt.Errorf("get hierarchy for %s: %w", roomID, err)
+					return
+				}
+				for _, child := range resp.Rooms {
+					roomDetails[child.RoomID.String()] = Room{ID: child.RoomID.String(), Name: child.Name}
+					if child.RoomID == roomID {
+						for _, relation := range child.ChildrenState {
+							if relation.Type == event.StateSpaceChild && relation.GetStateKey() != "" {
+								directIDs = append(directIDs, relation.GetStateKey())
+							}
 						}
 					}
 				}
+				if resp.NextBatch == "" {
+					break
+				}
+				from = resp.NextBatch
 			}
-			if resp.NextBatch == "" {
-				break
+			seen := make(map[string]bool)
+			for _, childID := range directIDs {
+				if seen[childID] || !joinedIDs[childID] {
+					continue
+				}
+				seen[childID] = true
+				child := roomDetails[childID]
+				if child.ID == "" {
+					child.ID = childID
+				}
+				space.Children = append(space.Children, child)
 			}
-			from = resp.NextBatch
+			results[i].space = &space
+		}()
+	}
+	workers.Wait()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	spaces := make([]Space, 0)
+	for _, result := range results {
+		if result.err != nil {
+			return nil, result.err
 		}
-		seen := make(map[string]bool)
-		for _, childID := range directIDs {
-			if seen[childID] {
-				continue
-			}
-			seen[childID] = true
-			child := roomDetails[childID]
-			if child.ID == "" {
-				child.ID = childID
-			}
-			space.Children = append(space.Children, child)
+		if result.space != nil {
+			spaces = append(spaces, *result.space)
 		}
-		spaces = append(spaces, space)
 	}
 	return spaces, nil
 }
@@ -266,9 +356,28 @@ func (c *Client) RecentMessages(ctx context.Context, room, from string, limit in
 	page := MessagePage{Messages: make([]Message, 0, len(resp.Chunk)), Next: resp.End}
 	for i := len(resp.Chunk) - 1; i >= 0; i-- {
 		evt := resp.Chunk[i]
-		if evt.Type == event.EventEncrypted && c.crypto != nil {
+		if evt.Type == event.EventEncrypted {
+			// /messages returns raw event content. CryptoHelper expects the typed
+			// encrypted content, unlike MessageFromEvent which parses it itself.
+			if evt.Content.Parsed == nil {
+				if len(evt.Content.VeryRaw) == 0 && evt.Content.Raw != nil {
+					evt.Content.VeryRaw, _ = json.Marshal(evt.Content.Raw)
+				}
+				if err := evt.Content.ParseRaw(evt.Type); err != nil {
+					page.Messages = append(page.Messages, undecryptableMessage(evt))
+					continue
+				}
+			}
+			if c.crypto == nil {
+				page.Messages = append(page.Messages, undecryptableMessage(evt))
+				continue
+			}
 			decrypted, decryptErr := c.crypto.Decrypt(ctx, evt)
 			if decryptErr != nil {
+				// Do not make encrypted rooms look empty when a session key is
+				// unavailable. A visible placeholder also explains why the content
+				// cannot be shown yet.
+				page.Messages = append(page.Messages, undecryptableMessage(evt))
 				continue
 			}
 			evt = decrypted
@@ -278,6 +387,20 @@ func (c *Client) RecentMessages(ctx context.Context, room, from string, limit in
 		}
 	}
 	return page, nil
+}
+
+func undecryptableMessage(evt *event.Event) Message {
+	message := Message{Body: "🔒 Unable to decrypt this message"}
+	if evt == nil {
+		return message
+	}
+	message.RoomID = evt.RoomID.String()
+	message.Sender = evt.Sender.String()
+	message.EventID = evt.ID.String()
+	if evt.Timestamp > 0 {
+		message.Timestamp = time.UnixMilli(evt.Timestamp)
+	}
+	return message
 }
 
 // Subscribe emits new plain-text room messages. Events from the initial sync are

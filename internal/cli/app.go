@@ -35,10 +35,12 @@ type App struct {
 
 	// Account hooks are set by NewDefault. Leaving them nil preserves the
 	// simple single-account setup used by embedders and tests.
-	SelectAccount func(string) (config.Store, session.Store, error)
-	ListAccounts  func() ([]string, error)
-	DeleteCrypto  func(string) error
-	Account       string
+	SelectAccount     func(string) (config.Store, session.Store, error)
+	ListAccounts      func() ([]string, error)
+	SetDefaultAccount func(string) error
+	DeleteCrypto      func(string) error
+	Account           string
+	DefaultAccount    string
 }
 
 func NewDefault() (*App, error) {
@@ -56,12 +58,24 @@ func NewDefault() (*App, error) {
 			Fallback: session.FileStore{Path: filepath.Join(filepath.Dir(accountPath), "session.json")},
 		}, nil
 	}
-	cfgStore, sessionStore, _ := selectAccount("default")
+	preferencesStore := config.AccountPreferencesStore{Path: config.AccountPreferencesPath(path)}
+	preferences, err := preferencesStore.Load()
+	if err != nil {
+		return nil, err
+	}
+	defaultAccount := preferences.DefaultAccount
+	cfgStore, sessionStore, _ := selectAccount(defaultAccount)
 	app := &App{
 		Config:        cfgStore,
 		Session:       sessionStore,
 		SelectAccount: selectAccount,
 		ListAccounts:  func() ([]string, error) { return config.ListAccounts(path) },
+		SetDefaultAccount: func(name string) error {
+			if err := preferencesStore.Save(config.AccountPreferences{DefaultAccount: name}); err != nil {
+				return err
+			}
+			return nil
+		},
 		DeleteCrypto: func(name string) error {
 			accountPath, err := config.AccountPath(path, name)
 			if err != nil {
@@ -75,7 +89,8 @@ func NewDefault() (*App, error) {
 			}
 			return nil
 		},
-		Account: "default",
+		Account:        defaultAccount,
+		DefaultAccount: defaultAccount,
 	}
 	app.NewMatrix = func(cfg config.Config, creds auth.Credentials) (matrix.API, error) {
 		accountPath, err := config.AccountPath(path, app.Account)
@@ -89,7 +104,10 @@ func NewDefault() (*App, error) {
 }
 
 func (a *App) Root() *cobra.Command {
-	account := "default"
+	account := a.DefaultAccount
+	if account == "" {
+		account = "default"
+	}
 	root := &cobra.Command{
 		Use:           "matrix",
 		Short:         "A small command-line Matrix client",
@@ -99,9 +117,9 @@ func (a *App) Root() *cobra.Command {
 			return a.useAccount(account)
 		},
 	}
-	root.PersistentFlags().StringVar(&account, "ac", "default", "account to use")
-	root.PersistentFlags().StringVar(&account, "account", "default", "account to use (same as --ac)")
-	root.AddCommand(a.loginCommand(), a.logoutCommand(), a.roomsCommand(), a.spacesCommand(), a.sendCommand(), a.watchCommand(), a.chatCommand(), a.tuiCommand(), a.keysCommand(), a.accountsCommand(), a.verifyCommand())
+	root.PersistentFlags().StringVar(&account, "ac", account, "account to use")
+	root.PersistentFlags().StringVar(&account, "account", account, "account to use (same as --ac)")
+	root.AddCommand(a.loginCommand(), a.logoutCommand(), a.roomsCommand(), a.spacesCommand(), a.sendCommand(), a.watchCommand(), a.chatCommand(), a.tuiCommand(), a.keysCommand(), a.configCommand(), a.accountsCommand(), a.verifyCommand())
 	return root
 }
 
@@ -144,8 +162,34 @@ func (a *App) newLoginCommand(use string, accountArgument bool) *cobra.Command {
 					return err
 				}
 			}
+			previous, previousErr := a.Config.Load()
+			if previousErr == nil {
+				if homeserver == "" {
+					homeserver = previous.HomeserverURL
+				}
+				if authURL == "" {
+					authURL = previous.AuthURL
+				}
+				if serverName == "" {
+					serverName = previous.ServerName
+				}
+				if username == "" {
+					username = previous.Username
+				}
+				if identityProvider == "" {
+					identityProvider = previous.SSOIDP
+				}
+				if !cmd.Flags().Changed("sso") && previous.AuthMethod == config.AuthMethodSSO {
+					useSSO = true
+				}
+			}
+			if !cmd.Flags().Changed("sso") && previous.AuthMethod == "" {
+				if previousCreds, loadErr := a.Session.Load(); loadErr == nil && previousCreds.OAuthTokenEndpoint != "" {
+					useSSO = true
+				}
+			}
 			if homeserver == "" {
-				return errors.New("--homeserver is required")
+				return errors.New("--homeserver is required for a new account")
 			}
 			if authURL == "" {
 				authURL = homeserver
@@ -203,9 +247,19 @@ func (a *App) newLoginCommand(use string, accountArgument bool) *cobra.Command {
 					return fmt.Errorf("reset old encryption store: %w", err)
 				}
 			}
-			cfg := config.Config{HomeserverURL: homeserver, AuthURL: authURL, ServerName: serverName, Username: username}
-			if previous, loadErr := a.Config.Load(); loadErr == nil {
+			authMethod := config.AuthMethodPassword
+			if useSSO {
+				authMethod = config.AuthMethodSSO
+			}
+			cfg := config.Config{HomeserverURL: homeserver, AuthURL: authURL, ServerName: serverName, Username: username, AuthMethod: authMethod}
+			if useSSO {
+				cfg.SSOIDP = identityProvider
+			}
+			if previousErr == nil {
 				cfg.Keybindings = previous.Keybindings
+				cfg.ThreadView = previous.ThreadView
+				cfg.Color = previous.Color
+				cfg.Theme = previous.Theme
 			}
 			if err := a.Session.Save(creds); err != nil {
 				return fmt.Errorf("store session in OS keyring: %w", err)
@@ -251,7 +305,44 @@ func (a *App) accountsCommand() *cobra.Command {
 		},
 	}
 	cmd.AddCommand(a.newLoginCommand("add <name>", true))
+	cmd.AddCommand(&cobra.Command{Use: "default <name>", Short: "Set the account used when --ac is omitted", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		if err := a.setDefaultAccount(args[0]); err != nil {
+			return err
+		}
+		fmt.Fprintf(cmd.OutOrStdout(), "Default account set to %s\n", args[0])
+		return nil
+	}})
 	return cmd
+}
+
+func (a *App) setDefaultAccount(name string) error {
+	if err := config.ValidateAccountName(name); err != nil {
+		return err
+	}
+	if a.ListAccounts != nil {
+		names, err := a.ListAccounts()
+		if err != nil {
+			return err
+		}
+		found := false
+		for _, candidate := range names {
+			if candidate == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("account %q is not configured", name)
+		}
+	}
+	if a.SetDefaultAccount == nil {
+		return errors.New("this app cannot change the default account")
+	}
+	if err := a.SetDefaultAccount(name); err != nil {
+		return err
+	}
+	a.DefaultAccount = name
+	return nil
 }
 
 func newCryptoPickleKey() (string, error) {
@@ -318,6 +409,17 @@ func (a *App) refreshCredentials(ctx context.Context, cfg config.Config, creds a
 	return refreshed, nil
 }
 
+type signInRequiredError struct {
+	Account string
+	Cause   error
+}
+
+func (e signInRequiredError) Error() string {
+	return fmt.Sprintf("sign-in required for account %q\nThe homeserver rejected the saved session.\nRun `matrix --ac %s login` to authenticate again.", e.Account, e.Account)
+}
+
+func (e signInRequiredError) Unwrap() error { return e.Cause }
+
 func (a *App) loadClient(ctx context.Context) (matrix.API, error) {
 	cfg, err := a.Config.Load()
 	if err != nil {
@@ -375,7 +477,7 @@ func (a *App) loadClient(ctx context.Context) (matrix.API, error) {
 		}
 		if err != nil {
 			if errors.Is(err, matrix.ErrInvalidSession) {
-				return nil, fmt.Errorf("%w; run `matrix login` again", err)
+				return nil, signInRequiredError{Account: a.Account, Cause: err}
 			}
 			return nil, err
 		}
@@ -481,6 +583,54 @@ func (a *App) spacesCommand() *cobra.Command {
 	}}
 }
 
+func (a *App) configCommand() *cobra.Command {
+	cmd := &cobra.Command{Use: "config", Short: "Show or change account settings", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) error {
+		cfg, err := a.Config.Load()
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(cmd.OutOrStdout(), "thread_view\t%s\n", cfg.EffectiveThreadView())
+		color := cfg.Color
+		if color == "" {
+			color = "default"
+		}
+		fmt.Fprintf(cmd.OutOrStdout(), "color\t%s\n", color)
+		fmt.Fprintf(cmd.OutOrStdout(), "theme\t%s\n", cfg.EffectiveTheme())
+		return nil
+	}}
+	cmd.AddCommand(&cobra.Command{Use: "set <setting> <value>", Short: "Change an account setting", Args: cobra.ExactArgs(2), RunE: func(cmd *cobra.Command, args []string) error {
+		setting, value := strings.ToLower(args[0]), strings.ToLower(args[1])
+		cfg, err := a.Config.Load()
+		if err != nil {
+			return err
+		}
+		switch setting {
+		case "thread_view":
+			if value != config.ThreadViewFocused && value != config.ThreadViewSplit {
+				return fmt.Errorf("invalid thread view %q (use %q or %q)", value, config.ThreadViewFocused, config.ThreadViewSplit)
+			}
+			cfg.ThreadView = value
+		case "color":
+			if value == "default" || value == "none" {
+				value = ""
+			}
+			if !config.ValidAccountColor(value) {
+				return fmt.Errorf("invalid account color %q (use #RRGGBB or default)", value)
+			}
+			cfg.Color = value
+		case "theme":
+			if value != config.ThemeMinimal && value != config.ThemeBoxed {
+				return fmt.Errorf("invalid theme %q (use %q or %q)", value, config.ThemeMinimal, config.ThemeBoxed)
+			}
+			cfg.Theme = value
+		default:
+			return fmt.Errorf("unknown config setting %q", setting)
+		}
+		return a.Config.Save(cfg)
+	}})
+	return cmd
+}
+
 func (a *App) keysCommand() *cobra.Command {
 	keys := &cobra.Command{Use: "keys", Short: "Show or change chat keybindings", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) error {
 		cfg, err := a.Config.Load()
@@ -559,17 +709,169 @@ func (a *App) watchCommand() *cobra.Command {
 	}}
 }
 
-func (a *App) tuiCommand() *cobra.Command {
-	return &cobra.Command{Use: "tui", Short: "Browse spaces and rooms interactively", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) error {
+type preparedTUIAccounts struct {
+	activeName    string
+	activeConfig  config.Config
+	activeClient  matrix.API
+	options       []tui.AccountOption
+	notifications <-chan tui.AccountNotification
+}
+
+func compactAccountError(err error) string {
+	if err == nil {
+		return ""
+	}
+	return strings.SplitN(err.Error(), "\n", 2)[0]
+}
+
+func (a *App) prepareTUIAccounts(ctx context.Context, preferred string) (preparedTUIAccounts, error) {
+	if a.ListAccounts == nil || a.SelectAccount == nil {
 		cfg, err := a.Config.Load()
 		if err != nil {
-			return err
+			return preparedTUIAccounts{}, err
 		}
-		client, err := a.loadClient(cmd.Context())
-		if err != nil {
-			return err
+		client, err := a.loadClient(ctx)
+		return preparedTUIAccounts{activeName: a.Account, activeConfig: cfg, activeClient: client}, err
+	}
+	names, err := a.ListAccounts()
+	if err != nil {
+		return preparedTUIAccounts{}, err
+	}
+	clients := make(map[string]matrix.API, len(names))
+	configs := make(map[string]config.Config, len(names))
+	options := make([]tui.AccountOption, 0, len(names))
+	for _, name := range names {
+		option := tui.AccountOption{Name: name, Default: name == a.DefaultAccount}
+		if err = a.useAccount(name); err != nil {
+			option.Error = compactAccountError(err)
+			options = append(options, option)
+			continue
 		}
-		return tui.RunNavigator(cmd.Context(), client, cfg)
+		cfg, loadErr := a.Config.Load()
+		if loadErr != nil {
+			option.Error = compactAccountError(loadErr)
+			options = append(options, option)
+			continue
+		}
+		option.Color = cfg.Color
+		if creds, loadErr := a.Session.Load(); loadErr == nil {
+			option.UserID = creds.UserID
+		}
+		client, loadErr := a.loadClient(ctx)
+		if loadErr != nil {
+			option.Error = compactAccountError(loadErr)
+		} else {
+			clients[name], configs[name] = client, cfg
+		}
+		options = append(options, option)
+	}
+	activeName := preferred
+	if clients[activeName] == nil {
+		activeName = ""
+		for _, option := range options {
+			if clients[option.Name] != nil {
+				activeName = option.Name
+				break
+			}
+		}
+	}
+	if activeName == "" {
+		return preparedTUIAccounts{}, errors.New("none of the configured accounts has a valid session; run `matrix --ac <name> login`")
+	}
+	if err = a.useAccount(activeName); err != nil {
+		return preparedTUIAccounts{}, err
+	}
+
+	notifications := startTUIAccountNotifications(ctx, options, clients, activeName)
+	return preparedTUIAccounts{
+		activeName: activeName, activeConfig: configs[activeName], activeClient: clients[activeName],
+		options: options, notifications: notifications,
+	}, nil
+}
+
+func startTUIAccountNotifications(ctx context.Context, options []tui.AccountOption, clients map[string]matrix.API, activeName string) <-chan tui.AccountNotification {
+	notifications := make(chan tui.AccountNotification, 256)
+	for _, option := range options {
+		name, accountColor, client := option.Name, option.Color, clients[option.Name]
+		if client == nil || name == activeName {
+			continue
+		}
+		// Room metadata for background notifications is loaded in the worker so
+		// it doesn't hold up rendering the UI.
+		messages, errs := client.Subscribe(ctx, "")
+		go func() {
+			roomNames := make(map[string]string)
+			if rooms, roomsErr := client.Rooms(ctx); roomsErr == nil {
+				for _, room := range rooms {
+					roomNames[room.ID] = room.Name
+				}
+			}
+			for messages != nil || errs != nil {
+				select {
+				case message, ok := <-messages:
+					if !ok {
+						messages = nil
+						continue
+					}
+					notification := tui.AccountNotification{Account: name, Color: accountColor, RoomName: roomNames[message.RoomID], Message: message}
+					select {
+					case notifications <- notification:
+					case <-ctx.Done():
+						return
+					}
+				case _, ok := <-errs:
+					if !ok {
+						errs = nil
+					}
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+	return notifications
+}
+
+func (a *App) tuiCommand() *cobra.Command {
+	return &cobra.Command{Use: "tui", Short: "Monitor and browse all local Matrix accounts", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) error {
+		activeName := a.Account
+		initialRoom := ""
+		var savedNotifications []tui.AccountNotification
+		savedUnread := make(map[string]int)
+		for {
+			switchCtx, cancel := context.WithCancel(cmd.Context())
+			type prepareResult struct {
+				accounts preparedTUIAccounts
+				err      error
+			}
+			preparedCh := make(chan prepareResult, 1)
+			done := make(chan struct{})
+			go func() {
+				prepared, err := a.prepareTUIAccounts(switchCtx, activeName)
+				preparedCh <- prepareResult{accounts: prepared, err: err}
+				close(done)
+			}()
+			if err := tui.RunLoading(switchCtx, "Connecting accounts…", done); err != nil {
+				cancel()
+				return err
+			}
+			loaded := <-preparedCh
+			prepared, err := loaded.accounts, loaded.err
+			if err != nil {
+				cancel()
+				return err
+			}
+			result, err := tui.RunWithAccounts(switchCtx, prepared.activeClient, prepared.activeConfig, initialRoom, tui.AccountSwitcher{
+				Current: prepared.activeName, Accounts: prepared.options, Notifications: prepared.notifications,
+				InitialNotifications: savedNotifications, InitialUnread: savedUnread, SetDefault: a.setDefaultAccount,
+			})
+			cancel()
+			savedNotifications, savedUnread = result.Notifications, result.Unread
+			if err != nil || result.Destination.Account == "" {
+				return err
+			}
+			activeName, initialRoom = result.Destination.Account, result.Destination.Room
+		}
 	}}
 }
 

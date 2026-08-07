@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -48,6 +50,75 @@ func TestValidateSessionChecksTokenAndIdentity(t *testing.T) {
 	}
 }
 
+func TestRoomsCalculateUnnamedDirectMessageName(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/joined_rooms"):
+			_, _ = w.Write([]byte(`{"joined_rooms":["!dm:test"]}`))
+		case strings.Contains(r.URL.Path, "/state/m.room.name"):
+			_, _ = w.Write([]byte(`{}`))
+		case strings.HasSuffix(r.URL.Path, "/joined_members"):
+			_, _ = w.Write([]byte(`{"joined":{"@me:test":{"display_name":"Me"},"@alice:test":{"display_name":"Alice"}}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client, err := New(server.URL, "@me:test", "DEV", "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rooms, err := client.Rooms(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rooms) != 1 || rooms[0].Name != "Alice" {
+		t.Fatalf("rooms = %#v", rooms)
+	}
+}
+
+func TestSpacesExcludeAccessibleButUnjoinedChildren(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/joined_rooms"):
+			_, _ = w.Write([]byte(`{"joined_rooms":["!space:test","!joined:test"]}`))
+		case strings.Contains(r.URL.Path, "/hierarchy"):
+			_, _ = w.Write([]byte(`{"rooms":[
+				{"room_id":"!space:test","name":"Team","children_state":[
+					{"type":"m.space.child","state_key":"!joined:test","content":{"via":["test"]}},
+					{"type":"m.space.child","state_key":"!public:test","content":{"via":["test"]}}
+				]},
+				{"room_id":"!joined:test","name":"Joined"},
+				{"room_id":"!public:test","name":"Public but not joined"}
+			]}`))
+		case strings.Contains(r.URL.Path, "/state/m.room.create"):
+			if strings.Contains(r.URL.Path, "!space:test") {
+				_, _ = w.Write([]byte(`{"type":"m.space"}`))
+			} else {
+				_, _ = w.Write([]byte(`{}`))
+			}
+		case strings.Contains(r.URL.Path, "/state/m.room.name"):
+			_, _ = w.Write([]byte(`{"name":"Team"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	client, err := New(server.URL, "@me:test", "DEV", "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	spaces, err := client.Spaces(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(spaces) != 1 || len(spaces[0].Children) != 1 || spaces[0].Children[0].ID != "!joined:test" {
+		t.Fatalf("spaces = %#v", spaces)
+	}
+}
+
 func TestMessageFromEvent(t *testing.T) {
 	evt := &event.Event{
 		Type: event.EventMessage, RoomID: id.RoomID("!room:test"), Sender: id.UserID("@alice:test"), ID: id.EventID("$event"), Timestamp: 1234,
@@ -62,6 +133,42 @@ func TestMessageFromEvent(t *testing.T) {
 	}
 	if !got.Timestamp.Equal(time.UnixMilli(1234)) {
 		t.Fatalf("timestamp = %s", got.Timestamp)
+	}
+}
+
+type historyCrypto struct{ sawSession bool }
+
+func (*historyCrypto) Init(context.Context) error { return nil }
+func (c *historyCrypto) Decrypt(_ context.Context, evt *event.Event) (*event.Event, error) {
+	c.sawSession = evt.Content.AsEncrypted().SessionID == id.SessionID("SESSION")
+	return &event.Event{
+		Type: event.EventMessage, RoomID: evt.RoomID, Sender: evt.Sender, ID: evt.ID, Timestamp: evt.Timestamp,
+		Content: event.Content{Parsed: &event.MessageEventContent{MsgType: event.MsgText, Body: "decrypted"}},
+	}, nil
+}
+func (*historyCrypto) Verify(context.Context, io.Reader, io.Writer) error { return nil }
+
+func TestRecentMessagesParsesEncryptedContentBeforeDecrypting(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"end":"next","chunk":[{
+			"type":"m.room.encrypted","room_id":"!room:test","event_id":"$encrypted","sender":"@a:test",
+			"content":{"algorithm":"m.megolm.v1.aes-sha2","ciphertext":"abc","device_id":"DEV","sender_key":"key","session_id":"SESSION"}
+		}]}`))
+	}))
+	defer server.Close()
+	client, err := New(server.URL, "@me:test", "DEV", "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	crypto := &historyCrypto{}
+	client.crypto = crypto
+	page, err := client.RecentMessages(context.Background(), "!room:test", "", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !crypto.sawSession || len(page.Messages) != 1 || page.Messages[0].Body != "decrypted" {
+		t.Fatalf("encrypted history was not parsed and decrypted: saw=%v page=%#v", crypto.sawSession, page)
 	}
 }
 
@@ -145,6 +252,20 @@ func TestMessageFromEventParsesRawHistoryContent(t *testing.T) {
 	got, ok := MessageFromEvent(evt)
 	if !ok || got.Body != "from history" {
 		t.Fatalf("message = %#v, ok = %v", got, ok)
+	}
+}
+
+func TestUndecryptableMessagePreservesHistoryMetadata(t *testing.T) {
+	evt := &event.Event{
+		Type: event.EventEncrypted, RoomID: id.RoomID("!room:test"), Sender: id.UserID("@alice:test"),
+		ID: id.EventID("$encrypted"), Timestamp: 1234,
+	}
+	got := undecryptableMessage(evt)
+	if got.RoomID != "!room:test" || got.Sender != "@alice:test" || got.EventID != "$encrypted" {
+		t.Fatalf("placeholder metadata = %#v", got)
+	}
+	if !strings.Contains(got.Body, "Unable to decrypt") || !got.Timestamp.Equal(time.UnixMilli(1234)) {
+		t.Fatalf("placeholder content = %#v", got)
 	}
 }
 

@@ -156,8 +156,23 @@ matrix --ac personal send '#general:matrix.org' 'hello'
 ```
 
 `--account` is the long-form alias for `--ac`. Account names may contain letters,
-numbers, `.`, `-`, and `_`. Login, encryption state, and keybindings are kept
-separate for each account. Logging out affects only the selected account:
+numbers, `.`, `-`, and `_`. Login, encryption state, appearance, and keybindings
+are kept separate for each account. Choose the account used when `--ac` is
+omitted with:
+
+```sh
+matrix accounts default personal
+```
+
+After an account has been configured, reauthenticate without repeating its
+homeserver, username, or SSO flags:
+
+```sh
+matrix --ac work login
+```
+
+The saved authentication method is reused and SSO accounts reopen the browser
+flow. Logging out affects only the selected account:
 
 ```sh
 matrix --ac work logout
@@ -174,6 +189,7 @@ connection metadata is stored separately in `config.json`.
 matrix login
 matrix accounts
 matrix accounts add <name> [--sso [--idp <provider-id>]]
+matrix accounts default <name>
 matrix [--ac <name>] logout
 matrix [--ac <name>] verify
 matrix rooms
@@ -184,6 +200,10 @@ matrix chat <room-id-or-alias>
 matrix tui
 matrix keys
 matrix keys set <action> <key>
+matrix config
+matrix config set thread_view <focused|split>
+matrix [--ac <name>] config set color <#RRGGBB|default>
+matrix [--ac <name>] config set theme <minimal|boxed>
 ```
 
 ## Chat controls
@@ -191,31 +211,80 @@ matrix keys set <action> <key>
 Chat starts in a normal mode inspired by Neovim:
 
 - `j` / `k`: select the next/previous message; `k` at the top loads an older page
-- `Ctrl+U`: explicitly load the next older page
-- `Enter`: open the selected message's thread in a side-by-side split
+- `Ctrl+U`: load up to 10 older messages
+- `Enter`: open the selected message's thread in a focused full-width view
 - `Esc`: close the current thread; press again to open the room/space navigator
 - `i`: enter insert mode
 - `Enter`: send from insert mode
 - `Esc`: return to normal mode
-- `n`: toggle room/space names and Matrix IDs
+- `a`: open the local account picker
+- `n`: open the cross-account notification inbox
+- `v`: toggle room/space names and Matrix IDs
 - `?`: show the effective keybinding help overlay
 - `q`: quit from normal mode
 
 Run `matrix tui` to start in the navigator. It shows **Home** first with rooms
-that are not in a space, followed by each space and its rooms. Use `j`/`k` and
-`Enter` to choose a room; `Esc` returns to the previous room when one is open.
+that are not in a space, followed by each space and its joined rooms. Use `j`/`k`
+and `Enter` to choose a room; the list scrolls to keep the selection visible.
+`Esc` returns to the previous room when one is open. Unnamed direct messages use
+the other member's display name instead of an opaque Matrix room ID.
+
+In the account picker, use `j`/`k` to select an account, `Enter` to switch,
+`d` to make it the default for future commands, and `Esc` to close the picker.
+Only accounts already added locally are shown. Each healthy account remains
+connected while the TUI runs, and its live unread count appears beside it.
+Accounts with expired sessions remain visible as **sign-in required** instead of
+preventing other accounts from connecting.
+
+Press `n` to open the notification inbox. It keeps the latest 100 incoming
+messages in memory, tagged with account, room, sender, timestamp, and preview.
+Pressing `Enter` switches account when needed and opens the message's room. The
+inbox survives in-TUI account switches but is cleared when the program exits.
+The initial implementation tracks new messages received while the TUI is open;
+loading historical server unread counts and evaluating full Matrix push rules
+are planned follow-ups.
+
+Give accounts distinct header and picker colors to make environments obvious:
+
+```sh
+matrix --ac work-dev config set color '#3B82F6'
+matrix --ac work-test config set color '#F59E0B'
+matrix --ac work-prod config set color '#EF4444'
+```
+
+Use `default` instead of a hex value to remove the color. Colors and the default
+account are local settings; they are not sent to Matrix.
 
 Use `matrix keys` to see effective bindings and, for example,
 `matrix keys set toggle_identifiers t` to change one. Bindings are saved in the
-normal config file. Room headers use `space -> room -> thread` breadcrumbs, and
-thread mode keeps the room timeline visible beside the thread. On narrow
-terminals the thread panes stack vertically. The navigator marks unread rooms,
-and messages use local timestamps with shortened sender names.
+normal config file. The default `minimal` theme uses whitespace, dim separators,
+a restrained palette, compact status hints, and `account / space / room / thread`
+headers. Normal mode has no badge; `INSERT` appears only while composing. The
+selected line uses a subtle left bar. Entering a thread replaces the room
+timeline with a full-width **Thread · N replies** view; `Esc` returns to the room.
+
+The previous rounded, bordered appearance remains available per account:
+
+```sh
+matrix --ac personal config set theme boxed
+```
+
+Use `minimal` to switch back.
+
+To restore the previous room/thread split layout for the selected account:
+
+```sh
+matrix --ac personal config set thread_view split
+```
+
+Use `focused` to switch back. The navigator marks unread rooms, and messages use
+local timestamps with shortened sender names.
 `matrix spaces` prints the joined space hierarchy using names where possible.
 
 `watch` and `chat` use Matrix `/sync` and only display live events after the
-initial sync. Chat initially loads 30 recent messages and paginates backward in
-30-message pages.
+initial sync. Chat initially loads 10 recent messages; press `Ctrl+U` to load up
+to 10 older messages. Encrypted history requests missing room keys from the
+account's other verified devices before showing an unavailable placeholder.
 
 ## Encrypted rooms and device verification
 
@@ -251,7 +320,8 @@ Important limitations:
   crypto store. Verify the new device again.
 - Logging out also removes that account's local crypto store.
 
-The client validates a saved token before opening the crypto store. If it says
-the session is no longer valid, log in again. For local/containerized servers,
-persist the homeserver database: recreating it invalidates saved tokens and
-Matrix device state.
+The client validates a saved token before opening the crypto store. A rejected
+session produces an account-specific sign-in command, for example
+`matrix --ac work login`; saved connection and authentication settings are
+reused. For local/containerized servers, persist the homeserver database:
+recreating it invalidates saved tokens and Matrix device state.

@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -19,7 +20,7 @@ func TestNavigatorGroupsHomeAndSpaces(t *testing.T) {
 			{ID: "!space:test", Name: "Team"},
 			{ID: "!child:test", Name: "General"},
 		},
-		spaces: []matrix.Space{{ID: "!space:test", Name: "Team", Children: []matrix.Room{{ID: "!child:test", Name: "General"}}}},
+		spaces: []matrix.Space{{ID: "!space:test", Name: "Team", Children: []matrix.Room{{ID: "!child:test", Name: "General"}, {ID: "!not-joined:test", Name: "Public but not joined"}}}},
 	}
 	model.buildNavigator()
 	if len(model.nav) != 2 {
@@ -40,26 +41,80 @@ func TestNavigatorGroupsHomeAndSpaces(t *testing.T) {
 	if strings.Contains(view, "!space:test") {
 		t.Errorf("navigator showed ID despite having a name: %s", view)
 	}
+	if strings.Contains(view, "Public but not joined") {
+		t.Errorf("navigator showed an unjoined space child: %s", view)
+	}
 }
 
-func TestThreadUsesSplitViewAndArrowBreadcrumb(t *testing.T) {
-	model := &chatModel{
-		keys: config.Config{}, width: 100, mode: normalMode,
+func TestNavigatorScrollsToKeepSelectionVisible(t *testing.T) {
+	rooms := make([]matrix.Room, 30)
+	for i := range rooms {
+		rooms[i] = matrix.Room{ID: fmt.Sprintf("!room%d:test", i), Name: fmt.Sprintf("Room %02d", i)}
+	}
+	model := &chatModel{keys: config.Config{}, navigator: true, width: 60, height: 12, rooms: rooms, navView: viewport.New(60, 7)}
+	model.buildNavigator()
+	model.navIndex = 0
+	first := ansi.Strip(model.navigatorView())
+	if !strings.Contains(first, "│ Room 00") || strings.Contains(first, "Room 29") {
+		t.Fatalf("navigator did not show first selection: %s", first)
+	}
+	model.navIndex = len(model.nav) - 1
+	last := ansi.Strip(model.navigatorView())
+	if !strings.Contains(last, "│ Room 29") || strings.Contains(last, "Room 00") {
+		t.Fatalf("navigator did not scroll to last selection: %s", last)
+	}
+}
+
+func threadTestModel(cfg config.Config) *chatModel {
+	return &chatModel{
+		keys: cfg, width: 100, height: 30, mode: normalMode,
 		view: viewport.New(40, 10), threadView: viewport.New(40, 10),
 		currentRoom: "!room:test",
 		roomInfo:    matrix.RoomInfo{Room: matrix.Room{ID: "!room:test", Name: "General"}, Spaces: []matrix.Room{{ID: "!space:test", Name: "Team"}}},
 		messages: map[string][]matrix.Message{"!room:test": {
 			{EventID: "$root", Sender: "@a:test", Body: "root"},
+			{EventID: "$other", Sender: "@c:test", Body: "not in thread"},
 			{EventID: "$reply", ThreadRoot: "$root", Sender: "@b:test", Body: "reply"},
 		}},
 		thread: "$root", rootSelection: 0, selection: 1,
 	}
+}
+
+func TestThreadUsesFocusedViewByDefault(t *testing.T) {
+	model := threadTestModel(config.Config{})
 	model.refreshView()
-	view := model.View()
-	if !strings.Contains(view, "Team -> General -> Thread") {
-		t.Fatalf("missing arrow breadcrumb: %s", view)
+	view := ansi.Strip(model.View())
+	if !strings.Contains(view, "Team / General / thread") || !strings.Contains(view, "Thread") {
+		t.Fatalf("thread context is not obvious: %s", view)
 	}
-	for _, text := range []string{"Room", "Thread", "root", "reply", "│"} {
+	for _, text := range []string{"root", "reply"} {
+		if !strings.Contains(view, text) {
+			t.Errorf("focused thread missing %q: %s", text, view)
+		}
+	}
+	if strings.Contains(view, "not in thread") {
+		t.Fatalf("focused thread still shows the room timeline: %s", view)
+	}
+}
+
+func TestMinimalThemeIsDefaultAndBoxedCanBeEnabled(t *testing.T) {
+	minimal := threadTestModel(config.Config{})
+	minimal.refreshView()
+	if view := ansi.Strip(minimal.View()); strings.Contains(view, "╭") || !strings.Contains(view, "──") {
+		t.Fatalf("unexpected minimal theme: %s", view)
+	}
+	boxed := threadTestModel(config.Config{Theme: config.ThemeBoxed})
+	boxed.refreshView()
+	if view := ansi.Strip(boxed.View()); !strings.Contains(view, "╭") {
+		t.Fatalf("boxed theme has no border: %s", view)
+	}
+}
+
+func TestThreadSplitViewCanBeEnabled(t *testing.T) {
+	model := threadTestModel(config.Config{ThreadView: config.ThreadViewSplit})
+	model.refreshView()
+	view := ansi.Strip(model.View())
+	for _, text := range []string{"Room", "Thread", "root", "reply", "not in thread"} {
 		if !strings.Contains(view, text) {
 			t.Errorf("split view missing %q: %s", text, view)
 		}
@@ -84,6 +139,68 @@ func TestMessageRenderingWrapsInsteadOfClippingInThreadPane(t *testing.T) {
 	}
 	if !strings.Contains(ansi.Strip(output), "must remain readable") {
 		t.Fatalf("end of wrapped message is missing: %s", output)
+	}
+}
+
+func TestAccountPickerSwitchesAndSetsDefault(t *testing.T) {
+	var defaultAccount string
+	model := &chatModel{
+		keys: config.Config{}, accountName: "dev", accountPicker: true, accountIndex: 1,
+		accounts:          []AccountOption{{Name: "dev", Color: "#ff0000", Default: true}, {Name: "prod", Color: "#00ff00"}},
+		setDefaultAccount: func(name string) error { defaultAccount = name; return nil },
+	}
+	view := ansi.Strip(model.accountPickerView())
+	for _, expected := range []string{"Accounts", "dev", "prod", "current", "default"} {
+		if !strings.Contains(view, expected) {
+			t.Fatalf("account picker missing %q: %s", expected, view)
+		}
+	}
+	_, _ = model.updateAccountPicker(model.keys.Key("set_default_account"))
+	if defaultAccount != "prod" || !model.accounts[1].Default || model.accounts[0].Default {
+		t.Fatalf("default was not updated: %q, %#v", defaultAccount, model.accounts)
+	}
+	_, cmd := model.updateAccountPicker(model.keys.Key("open_thread"))
+	if model.requested.Account != "prod" || cmd == nil {
+		t.Fatalf("account switch = %q, cmd=%v", model.requested.Account, cmd)
+	}
+}
+
+func TestNotificationInboxNavigatesAcrossAccounts(t *testing.T) {
+	model := &chatModel{
+		keys: config.Config{}, accountName: "dev", notificationPicker: true,
+		accounts:      []AccountOption{{Name: "dev", UserID: "@me:dev"}, {Name: "prod", Color: "#ff0000", UserID: "@me:prod"}},
+		accountUnread: map[string]int{"prod": 1},
+		notifications: []AccountNotification{{
+			Account: "prod", Color: "#ff0000", RoomName: "Incidents",
+			Message: matrix.Message{RoomID: "!incident:prod", Sender: "@alice:prod", Body: "deployment failed", Timestamp: time.Date(2026, 1, 1, 12, 41, 0, 0, time.Local)},
+		}},
+	}
+	view := ansi.Strip(model.notificationPickerView())
+	for _, expected := range []string{"Notifications · 1", "prod / Incidents", "alice", "deployment failed"} {
+		if !strings.Contains(view, expected) {
+			t.Fatalf("notification inbox missing %q: %s", expected, view)
+		}
+	}
+	_, cmd := model.updateNotificationPicker(model.keys.Key("open_thread"))
+	if cmd == nil || model.requested.Account != "prod" || model.requested.Room != "!incident:prod" {
+		t.Fatalf("destination = %#v, cmd=%v", model.requested, cmd)
+	}
+	if len(model.notifications) != 0 || model.accountUnread["prod"] != 0 {
+		t.Fatalf("notification was not cleared: %#v, %#v", model.notifications, model.accountUnread)
+	}
+}
+
+func TestBackgroundOwnMessageIsNotANotification(t *testing.T) {
+	channel := make(chan AccountNotification)
+	model := &chatModel{
+		keys: config.Config{}, accountNotifications: channel, accountUnread: make(map[string]int),
+		accounts: []AccountOption{{Name: "prod", UserID: "@me:prod"}},
+	}
+	_, _ = model.Update(accountNotificationMsg{ok: true, notification: AccountNotification{
+		Account: "prod", Message: matrix.Message{RoomID: "!room:prod", Sender: "@me:prod", Body: "mine"},
+	}})
+	if len(model.notifications) != 0 || model.accountUnread["prod"] != 0 {
+		t.Fatalf("own message created a notification: %#v", model.notifications)
 	}
 }
 

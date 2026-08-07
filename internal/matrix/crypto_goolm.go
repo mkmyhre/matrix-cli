@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"maunium.net/go/mautrix/crypto/cryptohelper"
 	"maunium.net/go/mautrix/crypto/goolm"
@@ -59,6 +60,23 @@ func (e *encryptedSupport) Init(ctx context.Context) error {
 }
 
 func (e *encryptedSupport) Decrypt(ctx context.Context, evt *event.Event) (*event.Event, error) {
+	decrypted, err := e.helper.Decrypt(ctx, evt)
+	if !errors.Is(err, cryptohelper.NoSessionFound) || evt == nil {
+		return decrypted, err
+	}
+
+	// Timeline history isn't processed by the sync callback that normally
+	// requests missing Megolm sessions. Explicitly request the room key from
+	// the sender and our other devices, then briefly wait for /sync to receive
+	// it before showing an undecryptable placeholder.
+	content := evt.Content.AsEncrypted()
+	if content.SessionID == "" || content.SenderKey == "" {
+		return nil, err
+	}
+	e.helper.RequestSession(ctx, evt.RoomID, content.SenderKey, content.SessionID, evt.Sender, content.DeviceID)
+	if !e.helper.WaitForSession(ctx, evt.RoomID, content.SenderKey, content.SessionID, 4*time.Second) {
+		return nil, err
+	}
 	return e.helper.Decrypt(ctx, evt)
 }
 
@@ -84,9 +102,13 @@ func (c *verificationCallbacks) VerificationReady(ctx context.Context, txnID id.
 		return
 	}
 	fmt.Fprintf(c.out, "Verification accepted by device %s.\n", deviceID)
-	if err := c.helper.StartSAS(ctx, txnID); err != nil {
-		c.fail(fmt.Errorf("start SAS verification: %w", err))
-	}
+	// VerificationHelper invokes callbacks while holding its transaction lock.
+	// StartSAS acquires that same lock, so it must run after this callback returns.
+	go func() {
+		if err := c.helper.StartSAS(ctx, txnID); err != nil {
+			c.fail(fmt.Errorf("start SAS verification: %w", err))
+		}
+	}()
 }
 func (c *verificationCallbacks) ShowSAS(ctx context.Context, txnID id.VerificationTransactionID, emojis []rune, descriptions []string, decimals []int) {
 	fmt.Fprintln(c.out, "Compare these emoji with the other Matrix client:")
@@ -115,9 +137,13 @@ func (c *verificationCallbacks) ShowSAS(ctx context.Context, txnID id.Verificati
 		c.fail(errors.New("verification was not confirmed"))
 		return
 	}
-	if err := c.helper.ConfirmSAS(ctx, txnID); err != nil {
-		c.fail(fmt.Errorf("confirm SAS verification: %w", err))
-	}
+	// As with VerificationReady, ShowSAS is called while the helper's
+	// transaction lock is held. Confirm only after returning from the callback.
+	go func() {
+		if err := c.helper.ConfirmSAS(ctx, txnID); err != nil {
+			c.fail(fmt.Errorf("confirm SAS verification: %w", err))
+		}
+	}()
 }
 func (c *verificationCallbacks) VerificationCancelled(_ context.Context, _ id.VerificationTransactionID, code event.VerificationCancelCode, reason string) {
 	c.fail(fmt.Errorf("verification cancelled (%s): %s", code, reason))
