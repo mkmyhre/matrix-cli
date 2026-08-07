@@ -11,6 +11,24 @@ import (
 	"time"
 )
 
+const defaultHTTPTimeout = 30 * time.Second
+
+var sharedHTTPClient = NewHTTPClient()
+
+// NewHTTPClient returns the standard client used for bounded authentication and
+// discovery requests. Callers may still inject a custom client for tests or
+// specialized transports.
+func NewHTTPClient() *http.Client {
+	return &http.Client{Timeout: defaultHTTPTimeout}
+}
+
+func httpClient(configured *http.Client) *http.Client {
+	if configured != nil {
+		return configured
+	}
+	return sharedHTTPClient
+}
+
 // Credentials are the result of a Matrix login. They must be kept in secret storage.
 type Credentials struct {
 	AccessToken        string    `json:"access_token"`
@@ -70,11 +88,7 @@ func (a PasswordAuthenticator) request(ctx context.Context, path string, payload
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
-	client := a.Client
-	if client == nil {
-		client = &http.Client{Timeout: 30 * time.Second}
-	}
-	resp, err := client.Do(req)
+	resp, err := httpClient(a.Client).Do(req)
 	if err != nil {
 		return Credentials{}, fmt.Errorf("authentication request: %w", err)
 	}

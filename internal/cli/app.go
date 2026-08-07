@@ -68,6 +68,7 @@ func NewDefault() (*App, error) {
 	app := &App{
 		Config:        cfgStore,
 		Session:       sessionStore,
+		HTTP:          auth.NewHTTPClient(),
 		SelectAccount: selectAccount,
 		ListAccounts:  func() ([]string, error) { return config.ListAccounts(path) },
 		SetDefaultAccount: func(name string) error {
@@ -194,6 +195,12 @@ func (a *App) newLoginCommand(use string, accountArgument bool) *cobra.Command {
 			if authURL == "" {
 				authURL = homeserver
 			}
+			if err := config.ValidateBaseURL("homeserver", homeserver); err != nil {
+				return err
+			}
+			if err := config.ValidateBaseURL("authentication", authURL); err != nil {
+				return err
+			}
 			if identityProvider != "" && !useSSO {
 				return errors.New("--idp requires --sso")
 			}
@@ -242,11 +249,6 @@ func (a *App) newLoginCommand(use string, accountArgument bool) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if a.DeleteCrypto != nil {
-				if err := a.DeleteCrypto(a.Account); err != nil {
-					return fmt.Errorf("reset old encryption store: %w", err)
-				}
-			}
 			authMethod := config.AuthMethodPassword
 			if useSSO {
 				authMethod = config.AuthMethodSSO
@@ -261,11 +263,7 @@ func (a *App) newLoginCommand(use string, accountArgument bool) *cobra.Command {
 				cfg.Color = previous.Color
 				cfg.Theme = previous.Theme
 			}
-			if err := a.Session.Save(creds); err != nil {
-				return fmt.Errorf("store session in OS keyring: %w", err)
-			}
-			if err := a.Config.Save(cfg); err != nil {
-				_ = a.Session.Delete()
+			if err := a.persistLogin(cfg, creds); err != nil {
 				return err
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "Logged in as %s\n", creds.UserID)
@@ -343,6 +341,77 @@ func (a *App) setDefaultAccount(name string) error {
 	}
 	a.DefaultAccount = name
 	return nil
+}
+
+type loginSnapshot struct {
+	config         config.Config
+	configPresent  bool
+	credentials    auth.Credentials
+	sessionPresent bool
+}
+
+func (a *App) snapshotLogin() loginSnapshot {
+	var snapshot loginSnapshot
+	if cfg, err := a.Config.Load(); err == nil {
+		snapshot.config, snapshot.configPresent = cfg, true
+	}
+	if credentials, err := a.Session.Load(); err == nil {
+		snapshot.credentials, snapshot.sessionPresent = credentials, true
+	}
+	return snapshot
+}
+
+func restoreConfig(store config.Store, snapshot loginSnapshot) error {
+	if snapshot.configPresent {
+		return store.Save(snapshot.config)
+	}
+	return store.Delete()
+}
+
+func restoreSession(store session.Store, snapshot loginSnapshot) error {
+	if snapshot.sessionPresent {
+		return store.Save(snapshot.credentials)
+	}
+	return store.Delete()
+}
+
+// persistLogin commits config and credentials as one logical operation. Each
+// failed stage restores the state observed before the login, including stores
+// that mutate their contents before returning an error.
+func (a *App) persistLogin(cfg config.Config, credentials auth.Credentials) error {
+	snapshot := a.snapshotLogin()
+	if err := a.Session.Save(credentials); err != nil {
+		rollbackErr := restoreSession(a.Session, snapshot)
+		return errors.Join(fmt.Errorf("store session: %w", err), errorWithContext("restore previous session", rollbackErr))
+	}
+	if err := a.Config.Save(cfg); err != nil {
+		configRollbackErr := restoreConfig(a.Config, snapshot)
+		sessionRollbackErr := restoreSession(a.Session, snapshot)
+		return errors.Join(
+			fmt.Errorf("store config: %w", err),
+			errorWithContext("restore previous config", configRollbackErr),
+			errorWithContext("restore previous session", sessionRollbackErr),
+		)
+	}
+	if a.DeleteCrypto != nil {
+		if err := a.DeleteCrypto(a.Account); err != nil {
+			configRollbackErr := restoreConfig(a.Config, snapshot)
+			sessionRollbackErr := restoreSession(a.Session, snapshot)
+			return errors.Join(
+				fmt.Errorf("reset old encryption store: %w", err),
+				errorWithContext("restore previous config", configRollbackErr),
+				errorWithContext("restore previous session", sessionRollbackErr),
+			)
+		}
+	}
+	return nil
+}
+
+func errorWithContext(message string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s: %w", message, err)
 }
 
 func newCryptoPickleKey() (string, error) {
@@ -518,18 +587,39 @@ func (a *App) logoutCommand() *cobra.Command {
 		if loadErr == nil {
 			remoteErr = client.Logout(cmd.Context())
 		}
-		secretErr := a.Session.Delete()
-		configErr := a.Config.Delete()
-		var cryptoErr error
-		if a.DeleteCrypto != nil {
-			cryptoErr = a.DeleteCrypto(a.Account)
-		}
-		if err := errors.Join(remoteErr, secretErr, configErr, cryptoErr); err != nil {
+		localErr := a.clearLogin()
+		if err := errors.Join(remoteErr, localErr); err != nil {
 			return err
 		}
 		fmt.Fprintln(cmd.OutOrStdout(), "Logged out")
 		return nil
 	}}
+}
+
+// clearLogin removes the secret before its config and restores the secret if
+// config cleanup fails. This prevents a failed logout from orphaning a live
+// keyring credential with no account metadata from which to retry cleanup.
+func (a *App) clearLogin() error {
+	snapshot := a.snapshotLogin()
+	if err := a.Session.Delete(); err != nil {
+		return errors.Join(
+			fmt.Errorf("delete session: %w", err),
+			errorWithContext("restore session after cleanup failure", restoreSession(a.Session, snapshot)),
+		)
+	}
+	if err := a.Config.Delete(); err != nil {
+		return errors.Join(
+			fmt.Errorf("delete config: %w", err),
+			errorWithContext("restore config after cleanup failure", restoreConfig(a.Config, snapshot)),
+			errorWithContext("restore session after config cleanup failure", restoreSession(a.Session, snapshot)),
+		)
+	}
+	if a.DeleteCrypto != nil {
+		if err := a.DeleteCrypto(a.Account); err != nil {
+			return fmt.Errorf("delete encryption store: %w", err)
+		}
+	}
+	return nil
 }
 
 func (a *App) roomsCommand() *cobra.Command {
@@ -819,9 +909,18 @@ func startTUIAccountNotifications(ctx context.Context, options []tui.AccountOpti
 					case <-ctx.Done():
 						return
 					}
-				case _, ok := <-errs:
+				case syncErr, ok := <-errs:
 					if !ok {
 						errs = nil
+						continue
+					}
+					if syncErr != nil {
+						notification := tui.AccountNotification{Account: name, Color: accountColor, Error: compactAccountError(syncErr)}
+						select {
+						case notifications <- notification:
+						case <-ctx.Done():
+							return
+						}
 					}
 				case <-ctx.Done():
 					return

@@ -15,6 +15,16 @@ import (
 	"maunium.net/go/mautrix/id"
 )
 
+func TestNewConfiguresHTTPRetryPolicy(t *testing.T) {
+	client, err := New("https://matrix.test", "@me:test", "DEV", "token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.raw.DefaultHTTPRetries != defaultHTTPRetries || client.raw.DefaultHTTPBackoff != defaultHTTPBackoff {
+		t.Fatalf("retry policy = %d, %s", client.raw.DefaultHTTPRetries, client.raw.DefaultHTTPBackoff)
+	}
+}
+
 func TestValidateSessionChecksTokenAndIdentity(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -241,6 +251,28 @@ func TestSubscribeSkipsInitialTimeline(t *testing.T) {
 		t.Fatalf("sync failed: %v", err)
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for message")
+	}
+}
+
+func TestSubscribeClassifiesRejectedToken(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"errcode":"M_UNKNOWN_TOKEN","error":"expired"}`))
+	}))
+	defer server.Close()
+	client, err := New(server.URL, "@me:test", "DEV", "expired")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, errs := client.Subscribe(context.Background(), "")
+	select {
+	case err = <-errs:
+		if !errors.Is(err, ErrInvalidSession) {
+			t.Fatalf("error was not classified as invalid session: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for sync error")
 	}
 }
 

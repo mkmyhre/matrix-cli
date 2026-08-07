@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"matrix-cli/internal/config"
 	"matrix-cli/internal/matrix"
 	"matrix-cli/internal/session"
+	"matrix-cli/internal/tui"
 )
 
 type memoryConfig struct {
@@ -44,6 +46,66 @@ func (s *memorySession) Load() (auth.Credentials, error) {
 }
 func (s *memorySession) Save(v auth.Credentials) error { s.value = v; s.present = true; return nil }
 func (s *memorySession) Delete() error                 { s.present = false; return nil }
+
+type failOnceConfig struct {
+	*memoryConfig
+	err error
+}
+
+func (s *failOnceConfig) Save(v config.Config) error {
+	s.memoryConfig.Save(v) // Model a backend that mutates before reporting failure.
+	if s.err != nil {
+		err := s.err
+		s.err = nil
+		return err
+	}
+	return nil
+}
+
+type failOnceSession struct {
+	*memorySession
+	err error
+}
+
+func (s *failOnceSession) Save(v auth.Credentials) error {
+	s.memorySession.Save(v) // Model a backend that mutates before reporting failure.
+	if s.err != nil {
+		err := s.err
+		s.err = nil
+		return err
+	}
+	return nil
+}
+
+type failOnceDeleteConfig struct {
+	*memoryConfig
+	err error
+}
+
+func (s *failOnceDeleteConfig) Delete() error {
+	s.memoryConfig.Delete()
+	if s.err != nil {
+		err := s.err
+		s.err = nil
+		return err
+	}
+	return nil
+}
+
+type failOnceDeleteSession struct {
+	*memorySession
+	err error
+}
+
+func (s *failOnceDeleteSession) Delete() error {
+	s.memorySession.Delete()
+	if s.err != nil {
+		err := s.err
+		s.err = nil
+		return err
+	}
+	return nil
+}
 
 type fakeMatrix struct {
 	sentRoom, sentBody string
@@ -173,6 +235,96 @@ func TestLoginReusesSavedAccountDetails(t *testing.T) {
 	}
 }
 
+func TestPersistLoginRollsBackSessionFailure(t *testing.T) {
+	oldConfig := config.Config{HomeserverURL: "https://old", AuthURL: "https://old", Username: "old"}
+	oldCredentials := auth.Credentials{AccessToken: "old-token", UserID: "@old:test"}
+	cfg := &memoryConfig{value: oldConfig, present: true}
+	sess := &failOnceSession{memorySession: &memorySession{value: oldCredentials, present: true}, err: errors.New("keyring failed")}
+	app := &App{Config: cfg, Session: sess}
+
+	err := app.persistLogin(
+		config.Config{HomeserverURL: "https://new", AuthURL: "https://new", Username: "new"},
+		auth.Credentials{AccessToken: "new-token", UserID: "@new:test"},
+	)
+	if err == nil || !strings.Contains(err.Error(), "store session") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !reflect.DeepEqual(cfg.value, oldConfig) || sess.value != oldCredentials || !cfg.present || !sess.present {
+		t.Fatalf("state was not restored: config=%#v session=%#v", cfg, sess.memorySession)
+	}
+}
+
+func TestPersistLoginRollsBackConfigFailure(t *testing.T) {
+	oldConfig := config.Config{HomeserverURL: "https://old", AuthURL: "https://old", Username: "old"}
+	oldCredentials := auth.Credentials{AccessToken: "old-token", UserID: "@old:test"}
+	cfg := &failOnceConfig{memoryConfig: &memoryConfig{value: oldConfig, present: true}, err: errors.New("disk failed")}
+	sess := &memorySession{value: oldCredentials, present: true}
+	app := &App{Config: cfg, Session: sess}
+
+	err := app.persistLogin(
+		config.Config{HomeserverURL: "https://new", AuthURL: "https://new", Username: "new"},
+		auth.Credentials{AccessToken: "new-token", UserID: "@new:test"},
+	)
+	if err == nil || !strings.Contains(err.Error(), "store config") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !reflect.DeepEqual(cfg.value, oldConfig) || sess.value != oldCredentials || !cfg.present || !sess.present {
+		t.Fatalf("state was not restored: config=%#v session=%#v", cfg.memoryConfig, sess)
+	}
+}
+
+func TestPersistLoginRollsBackCryptoResetFailure(t *testing.T) {
+	oldConfig := config.Config{HomeserverURL: "https://old", AuthURL: "https://old", Username: "old"}
+	oldCredentials := auth.Credentials{AccessToken: "old-token", UserID: "@old:test"}
+	cfg := &memoryConfig{value: oldConfig, present: true}
+	sess := &memorySession{value: oldCredentials, present: true}
+	app := &App{Config: cfg, Session: sess, DeleteCrypto: func(string) error { return errors.New("database busy") }}
+
+	err := app.persistLogin(
+		config.Config{HomeserverURL: "https://new", AuthURL: "https://new", Username: "new"},
+		auth.Credentials{AccessToken: "new-token", UserID: "@new:test"},
+	)
+	if err == nil || !strings.Contains(err.Error(), "reset old encryption store") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !reflect.DeepEqual(cfg.value, oldConfig) || sess.value != oldCredentials {
+		t.Fatalf("state was not restored: config=%#v session=%#v", cfg, sess)
+	}
+}
+
+func TestClearLoginRollsBackSessionDeleteFailure(t *testing.T) {
+	oldConfig := config.Config{HomeserverURL: "https://old", AuthURL: "https://old", Username: "old"}
+	oldCredentials := auth.Credentials{AccessToken: "old-token", UserID: "@old:test"}
+	cfg := &memoryConfig{value: oldConfig, present: true}
+	sess := &failOnceDeleteSession{memorySession: &memorySession{value: oldCredentials, present: true}, err: errors.New("keyring busy")}
+	cryptoDeleted := false
+	app := &App{Config: cfg, Session: sess, DeleteCrypto: func(string) error { cryptoDeleted = true; return nil }}
+
+	err := app.clearLogin()
+	if err == nil || !strings.Contains(err.Error(), "delete session") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfg.present || !sess.present || sess.value != oldCredentials || cryptoDeleted {
+		t.Fatalf("logout was not rolled back: config=%#v session=%#v cryptoDeleted=%v", cfg, sess.memorySession, cryptoDeleted)
+	}
+}
+
+func TestClearLoginRollsBackConfigDeleteFailure(t *testing.T) {
+	oldConfig := config.Config{HomeserverURL: "https://old", AuthURL: "https://old", Username: "old"}
+	oldCredentials := auth.Credentials{AccessToken: "old-token", UserID: "@old:test"}
+	cfg := &failOnceDeleteConfig{memoryConfig: &memoryConfig{value: oldConfig, present: true}, err: errors.New("disk busy")}
+	sess := &memorySession{value: oldCredentials, present: true}
+	app := &App{Config: cfg, Session: sess}
+
+	err := app.clearLogin()
+	if err == nil || !strings.Contains(err.Error(), "delete config") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfg.present || !sess.present || !reflect.DeepEqual(cfg.value, oldConfig) || sess.value != oldCredentials {
+		t.Fatalf("logout was not rolled back: config=%#v session=%#v", cfg.memoryConfig, sess)
+	}
+}
+
 func TestSSOLoginRejectsPasswordFlag(t *testing.T) {
 	root := testApp(&fakeMatrix{}).Root()
 	root.SetArgs([]string{"login", "--homeserver", "https://hs", "--sso", "--password", "secret"})
@@ -290,6 +442,28 @@ func TestPrepareTUIAccountsKeepsBackgroundAccountsLive(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("background account notification was not forwarded")
+	}
+}
+
+func TestBackgroundAccountSyncErrorsAreForwarded(t *testing.T) {
+	syncErrors := make(chan error, 1)
+	syncErrors <- errors.New("connection lost")
+	close(syncErrors)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	notifications := startTUIAccountNotifications(ctx,
+		[]tui.AccountOption{{Name: "dev"}, {Name: "prod", Color: "#ff0000"}},
+		map[string]matrix.API{"dev": &fakeMatrix{}, "prod": &fakeMatrix{streamErrors: syncErrors}},
+		"dev",
+	)
+	select {
+	case notification := <-notifications:
+		if notification.Account != "prod" || notification.Error != "connection lost" || notification.Color != "#ff0000" {
+			t.Fatalf("notification = %#v", notification)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("background sync error was not forwarded")
 	}
 }
 

@@ -44,6 +44,7 @@ type AccountNotification struct {
 	Color    string
 	RoomName string
 	Message  matrix.Message
+	Error    string
 }
 
 // AccountDestination requests navigation to an account and optional room.
@@ -490,7 +491,15 @@ func (m *chatModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case accountNotificationMsg:
 		if msg.ok {
-			if msg.notification.Message.Sender != m.accountUserID(msg.notification.Account) {
+			if msg.notification.Error != "" {
+				for i := range m.accounts {
+					if m.accounts[i].Name == msg.notification.Account {
+						m.accounts[i].Error = msg.notification.Error
+						break
+					}
+				}
+				m.status = fmt.Sprintf("%s sync error: %s", msg.notification.Account, msg.notification.Error)
+			} else if msg.notification.Message.Sender != m.accountUserID(msg.notification.Account) {
 				m.addNotification(msg.notification)
 			}
 			return m, waitAccountNotification(m.accountNotifications)

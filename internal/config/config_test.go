@@ -87,6 +87,61 @@ func TestThreadViewDefaultsToFocusedAndValidates(t *testing.T) {
 	}
 }
 
+func TestConfigValidatesBaseURLs(t *testing.T) {
+	tests := []struct {
+		name string
+		url  string
+	}{
+		{name: "relative", url: "matrix.example"},
+		{name: "unsupported scheme", url: "file:///tmp/matrix"},
+		{name: "missing host", url: "https:///matrix"},
+		{name: "credentials", url: "https://alice:secret@matrix.example"},
+		{name: "query", url: "https://matrix.example?tenant=one"},
+		{name: "fragment", url: "https://matrix.example/#client"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := Config{HomeserverURL: test.url, AuthURL: "https://auth.example", Username: "alice"}
+			if err := cfg.Validate(); err == nil {
+				t.Fatalf("URL %q was accepted", test.url)
+			}
+		})
+	}
+	for _, valid := range []string{"https://matrix.example", "http://localhost:8008", "https://example.test/matrix"} {
+		cfg := Config{HomeserverURL: valid, AuthURL: valid, Username: "alice"}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("valid URL %q rejected: %v", valid, err)
+		}
+	}
+}
+
+func TestConfigValidatesKeybindingsAndConflicts(t *testing.T) {
+	base := Config{HomeserverURL: "https://matrix.test", AuthURL: "https://matrix.test", Username: "alice"}
+	tests := []struct {
+		name     string
+		bindings map[string]string
+	}{
+		{name: "unknown action", bindings: map[string]string{"launch_missiles": "x"}},
+		{name: "empty key", bindings: map[string]string{"quit": ""}},
+		{name: "whitespace", bindings: map[string]string{"quit": " q "}},
+		{name: "conflict", bindings: map[string]string{"quit": "j"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := base
+			cfg.Keybindings = test.bindings
+			if err := cfg.Validate(); err == nil {
+				t.Fatalf("bindings %#v were accepted", test.bindings)
+			}
+		})
+	}
+
+	base.Keybindings = map[string]string{"normal_mode": "esc", "send": "enter", "move_down": "down"}
+	if err := base.Validate(); err != nil {
+		t.Fatalf("valid contextual/default bindings rejected: %v", err)
+	}
+}
+
 func TestFileStoreRoundTripAndPermissions(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nested", "config.json")
 	store := FileStore{Path: path}

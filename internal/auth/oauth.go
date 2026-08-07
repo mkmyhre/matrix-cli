@@ -331,11 +331,7 @@ func (a SSOAuthenticator) postForm(ctx context.Context, endpoint string, values 
 }
 
 func (a SSOAuthenticator) doJSON(req *http.Request, output any) error {
-	client := a.Client
-	if client == nil {
-		client = &http.Client{Timeout: 30 * time.Second}
-	}
-	resp, err := client.Do(req)
+	resp, err := httpClient(a.Client).Do(req)
 	if err != nil {
 		return err
 	}

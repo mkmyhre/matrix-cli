@@ -65,6 +65,11 @@ type cryptoSupport interface {
 
 var ErrInvalidSession = errors.New("Matrix session is no longer valid")
 
+const (
+	defaultHTTPRetries = 3
+	defaultHTTPBackoff = time.Second
+)
+
 type Client struct {
 	raw    *mautrix.Client
 	crypto cryptoSupport
@@ -76,6 +81,11 @@ func New(homeserverURL, userID, deviceID, accessToken string) (*Client, error) {
 		return nil, err
 	}
 	raw.DeviceID = id.DeviceID(deviceID)
+	// Mautrix retries transport failures, gateway errors, and rate limits. This
+	// applies to one-shot commands as well as sync setup requests; the default
+	// syncer separately keeps long-running sync alive after transient failures.
+	raw.DefaultHTTPRetries = defaultHTTPRetries
+	raw.DefaultHTTPBackoff = defaultHTTPBackoff
 	return &Client{raw: raw}, nil
 }
 
@@ -445,6 +455,9 @@ func (c *Client) Subscribe(ctx context.Context, room string) (<-chan Message, <-
 			}
 		})
 		if err := c.raw.SyncWithContext(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			if errors.Is(err, mautrix.MUnknownToken) || errors.Is(err, mautrix.MMissingToken) {
+				err = fmt.Errorf("%w: sync access token was rejected", ErrInvalidSession)
+			}
 			errs <- err
 		}
 	}()

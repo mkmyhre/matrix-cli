@@ -165,6 +165,21 @@ func TestAccountPickerSwitchesAndSetsDefault(t *testing.T) {
 	}
 }
 
+func TestBackgroundAccountErrorIsVisible(t *testing.T) {
+	notifications := make(chan AccountNotification)
+	model := &chatModel{
+		accounts:             []AccountOption{{Name: "prod"}},
+		accountNotifications: notifications,
+	}
+	_, cmd := model.Update(accountNotificationMsg{ok: true, notification: AccountNotification{Account: "prod", Error: "session expired"}})
+	if model.accounts[0].Error != "session expired" || !strings.Contains(model.status, "prod sync error: session expired") {
+		t.Fatalf("account=%#v status=%q", model.accounts[0], model.status)
+	}
+	if cmd == nil {
+		t.Fatal("notification listener was not continued")
+	}
+}
+
 func TestNotificationInboxNavigatesAcrossAccounts(t *testing.T) {
 	model := &chatModel{
 		keys: config.Config{}, accountName: "dev", notificationPicker: true,

@@ -4,10 +4,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"matrix-cli/internal/fileutil"
 )
 
 // Config contains non-secret connection metadata. Tokens are stored separately.
@@ -62,6 +65,23 @@ func ValidKeyAction(action string) bool {
 	return ok
 }
 
+func ValidateBaseURL(name, value string) error {
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return fmt.Errorf("%s URL is invalid: %w", name, err)
+	}
+	if (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+		return fmt.Errorf("%s URL must be an absolute HTTP(S) URL", name)
+	}
+	if parsed.User != nil {
+		return fmt.Errorf("%s URL must not contain credentials", name)
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("%s URL must not contain a query or fragment", name)
+	}
+	return nil
+}
+
 func ValidAccountColor(color string) bool {
 	if color == "" {
 		return true
@@ -95,8 +115,14 @@ func (c Config) Validate() error {
 	if strings.TrimSpace(c.HomeserverURL) == "" {
 		return errors.New("homeserver URL is required")
 	}
+	if err := ValidateBaseURL("homeserver", c.HomeserverURL); err != nil {
+		return err
+	}
 	if strings.TrimSpace(c.AuthURL) == "" {
 		return errors.New("authentication URL is required")
+	}
+	if err := ValidateBaseURL("authentication", c.AuthURL); err != nil {
+		return err
 	}
 	if strings.TrimSpace(c.Username) == "" {
 		return errors.New("username is required")
@@ -113,7 +139,44 @@ func (c Config) Validate() error {
 	if c.Theme != "" && c.Theme != ThemeMinimal && c.Theme != ThemeBoxed {
 		return fmt.Errorf("invalid theme %q (use %q or %q)", c.Theme, ThemeMinimal, ThemeBoxed)
 	}
+	if err := c.validateKeybindings(); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (c Config) validateKeybindings() error {
+	for action, key := range c.Keybindings {
+		if !ValidKeyAction(action) {
+			return fmt.Errorf("unknown keybinding action %q", action)
+		}
+		if strings.TrimSpace(key) == "" {
+			return fmt.Errorf("keybinding for %q cannot be empty", action)
+		}
+		if key != strings.TrimSpace(key) {
+			return fmt.Errorf("keybinding for %q contains surrounding whitespace", action)
+		}
+	}
+
+	actions := make([]string, 0, len(DefaultKeybindings))
+	for action := range DefaultKeybindings {
+		actions = append(actions, action)
+	}
+	sort.Strings(actions)
+	for i, first := range actions {
+		for _, second := range actions[i+1:] {
+			if c.Key(first) != c.Key(second) || compatibleKeybindingPair(first, second) {
+				continue
+			}
+			return fmt.Errorf("keybindings for %q and %q conflict on %q", first, second, c.Key(first))
+		}
+	}
+	return nil
+}
+
+func compatibleKeybindingPair(first, second string) bool {
+	pair := first + ":" + second
+	return pair == "close_thread:normal_mode" || pair == "open_thread:send"
 }
 
 type Store interface {
@@ -214,13 +277,10 @@ func (s FileStore) Save(cfg Config) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(s.Path), 0o700); err != nil {
-		return fmt.Errorf("create config directory: %w", err)
-	}
-	if err := os.WriteFile(s.Path, append(raw, '\n'), 0o600); err != nil {
+	if err := fileutil.WriteFileAtomic(s.Path, append(raw, '\n'), 0o600); err != nil {
 		return fmt.Errorf("write config: %w", err)
 	}
-	return os.Chmod(s.Path, 0o600)
+	return nil
 }
 
 func (s FileStore) Delete() error {

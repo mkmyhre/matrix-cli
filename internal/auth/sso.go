@@ -166,11 +166,7 @@ func (a SSOAuthenticator) checkFlow(ctx context.Context, identityProvider string
 	if err != nil {
 		return err
 	}
-	client := a.Client
-	if client == nil {
-		client = &http.Client{Timeout: 30 * time.Second}
-	}
-	resp, err := client.Do(req)
+	resp, err := httpClient(a.Client).Do(req)
 	if err != nil {
 		return fmt.Errorf("discover Matrix login flows: %w", err)
 	}

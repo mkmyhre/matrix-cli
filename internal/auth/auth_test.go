@@ -11,6 +11,16 @@ import (
 	"time"
 )
 
+func TestNewHTTPClientHasBoundedTimeout(t *testing.T) {
+	client := NewHTTPClient()
+	if client.Timeout != defaultHTTPTimeout || client.Timeout <= 0 {
+		t.Fatalf("timeout = %s", client.Timeout)
+	}
+	if httpClient(client) != client || httpClient(nil) != sharedHTTPClient {
+		t.Fatal("HTTP client selection did not preserve configured/shared clients")
+	}
+}
+
 func TestPasswordLoginUsesConfiguredAuthURL(t *testing.T) {
 	var path string
 	var payload map[string]any

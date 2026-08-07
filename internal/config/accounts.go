@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"matrix-cli/internal/fileutil"
 )
 
 // AccountPreferences contains settings shared across all local accounts.
@@ -48,11 +50,8 @@ func (s AccountPreferencesStore) Save(preferences AccountPreferences) error {
 	if err != nil {
 		return err
 	}
-	if err = os.MkdirAll(filepath.Dir(s.Path), 0o700); err != nil {
-		return fmt.Errorf("create account preferences directory: %w", err)
-	}
-	if err = os.WriteFile(s.Path, append(raw, '\n'), 0o600); err != nil {
+	if err = fileutil.WriteFileAtomic(s.Path, append(raw, '\n'), 0o600); err != nil {
 		return fmt.Errorf("write account preferences: %w", err)
 	}
-	return os.Chmod(s.Path, 0o600)
+	return nil
 }

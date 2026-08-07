@@ -4,10 +4,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
-
 	"matrix-cli/internal/auth"
+	"matrix-cli/internal/fileutil"
+	"os"
 )
 
 // FileStore is a fallback for systems without an OS keyring (for example,
@@ -38,13 +37,10 @@ func (s FileStore) Save(creds auth.Credentials) error {
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(s.Path), 0o700); err != nil {
-		return fmt.Errorf("create session directory: %w", err)
-	}
-	if err := os.WriteFile(s.Path, append(raw, '\n'), 0o600); err != nil {
+	if err := fileutil.WriteFileAtomic(s.Path, append(raw, '\n'), 0o600); err != nil {
 		return fmt.Errorf("write session file: %w", err)
 	}
-	return os.Chmod(s.Path, 0o600)
+	return nil
 }
 
 func (s FileStore) Delete() error {
