@@ -227,6 +227,48 @@ func TestNavigatorShowsUnreadCount(t *testing.T) {
 	}
 }
 
+func TestOpeningRoomReplacesStaleHistoryWithLatestPage(t *testing.T) {
+	base := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	model := &chatModel{
+		messages: map[string][]matrix.Message{"!room:test": {
+			{EventID: "$old-1", Body: "old 1", Timestamp: base},
+			{EventID: "$old-2", Body: "old 2", Timestamp: base.Add(time.Minute)},
+		}},
+		nextPage: make(map[string]string), unread: make(map[string]int),
+		view: viewport.New(80, 20), threadView: viewport.New(40, 20),
+	}
+	latest := []matrix.Message{
+		{EventID: "$new-1", Body: "new 1", Timestamp: base.Add(2 * time.Minute)},
+		{EventID: "$new-2", Body: "new 2", Timestamp: base.Add(3 * time.Minute)},
+	}
+	_, _ = model.Update(roomLoadedMsg{
+		info: matrix.RoomInfo{Room: matrix.Room{ID: "!room:test"}},
+		page: matrix.MessagePage{Messages: latest, Next: "next"},
+	})
+
+	got := model.messages["!room:test"]
+	if len(got) != 2 || got[0].EventID != "$new-1" || got[1].EventID != "$new-2" {
+		t.Fatalf("room history = %#v, want only latest page", got)
+	}
+	if model.selection != 1 {
+		t.Fatalf("selection = %d, want newest message", model.selection)
+	}
+}
+
+func TestOpeningRoomPreservesLiveMessageReceivedDuringHistoryFetch(t *testing.T) {
+	base := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	recent := []matrix.Message{{EventID: "$recent", Timestamp: base}}
+	cached := []matrix.Message{
+		{EventID: "$stale", Timestamp: base.Add(-time.Minute)},
+		{EventID: "$recent", Timestamp: base},
+		{EventID: "$live", Timestamp: base.Add(time.Minute)},
+	}
+	got := replaceWithRecentMessages(recent, cached)
+	if len(got) != 2 || got[0].EventID != "$recent" || got[1].EventID != "$live" {
+		t.Fatalf("replaced history = %#v", got)
+	}
+}
+
 func TestHelpShowsEffectiveBindings(t *testing.T) {
 	model := &chatModel{keys: config.Config{Keybindings: map[string]string{"move_down": "down"}}}
 	view := model.helpView()

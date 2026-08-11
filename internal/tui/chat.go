@@ -538,7 +538,11 @@ func (m *chatModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 		m.roomInfo = msg.info
 		m.currentRoom = msg.info.ID
 		delete(m.unread, msg.info.ID)
-		m.messages[msg.info.ID] = mergeMessages(msg.page.Messages, m.messages[msg.info.ID])
+		// Opening a room starts a new history window. Keeping the old cache after
+		// the newly fetched page puts stale messages after the latest page, so the
+		// selection lands on what used to be the newest message. Only retain live
+		// events that arrived while this history request was in flight.
+		m.messages[msg.info.ID] = replaceWithRecentMessages(msg.page.Messages, m.messages[msg.info.ID])
 		m.nextPage[msg.info.ID] = msg.page.Next
 		m.thread = ""
 		m.rootSelection = 0
@@ -723,6 +727,41 @@ func mergeMessages(first, second []matrix.Message) []matrix.Message {
 		}
 	}
 	return merged
+}
+
+// replaceWithRecentMessages discards a room's previous history window while
+// preserving events newer than the fetched page. Such events may have arrived
+// from /sync while the /messages request was in flight.
+func replaceWithRecentMessages(recent, cached []matrix.Message) []matrix.Message {
+	result := append([]matrix.Message(nil), recent...)
+	if len(recent) == 0 {
+		return result
+	}
+	seen := make(map[string]bool, len(recent))
+	var newest time.Time
+	for _, msg := range recent {
+		if msg.EventID != "" {
+			seen[msg.EventID] = true
+		}
+		if msg.Timestamp.After(newest) {
+			newest = msg.Timestamp
+		}
+	}
+	if newest.IsZero() {
+		return result
+	}
+	for _, msg := range cached {
+		if msg.EventID != "" && seen[msg.EventID] {
+			continue
+		}
+		if msg.Timestamp.After(newest) {
+			result = append(result, msg)
+			if msg.EventID != "" {
+				seen[msg.EventID] = true
+			}
+		}
+	}
+	return result
 }
 
 func (m *chatModel) mainMessages() []matrix.Message {
