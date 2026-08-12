@@ -128,6 +128,9 @@ type chatModel struct {
 	navigator        bool
 	navigatorLoading bool
 	navigatorError   string
+	loadingFrame     int
+	loadingTicker    bool
+	roomLoading      bool
 
 	currentRoom          string
 	roomInfo             matrix.RoomInfo
@@ -234,7 +237,7 @@ func run(ctx context.Context, client matrix.API, initialRoom string, cfg config.
 // startupCmd is kept outside Init's fixed stream commands so chat can load an
 // initial room while the all-room sync starts.
 func (m *chatModel) Init() tea.Cmd {
-	cmds := []tea.Cmd{waitIncoming(m.incoming), waitError(m.errors), m.loadNavigator()}
+	cmds := []tea.Cmd{waitIncoming(m.incoming), waitError(m.errors), m.loadNavigator(), m.ensureLoadingTick()}
 	if m.startupCmd != nil {
 		cmds = append(cmds, m.startupCmd)
 	}
@@ -289,6 +292,7 @@ func (m *chatModel) loadNavigator() tea.Cmd {
 }
 
 func (m *chatModel) loadRoom(room string) tea.Cmd {
+	m.roomLoading = true
 	// Room loads can overlap when Enter is pressed twice or a notification is
 	// opened while another request is running. Tag each request so a slower,
 	// older response cannot navigate the UI back to the wrong room.
@@ -306,7 +310,7 @@ func (m *chatModel) loadRoom(room string) tea.Cmd {
 			}
 		}
 	}
-	return func() tea.Msg {
+	request := func() tea.Msg {
 		info, err := m.client.RoomInfo(m.ctx, room)
 		if err != nil {
 			return roomLoadedMsg{requestVersion: requestVersion, err: err}
@@ -314,6 +318,7 @@ func (m *chatModel) loadRoom(room string) tea.Cmd {
 		page, err := m.fetchHistory(info.ID, "")
 		return roomLoadedMsg{info: info, page: page, requestVersion: requestVersion, previousEvents: previousEvents, err: err}
 	}
+	return tea.Batch(request, m.ensureLoadingTick())
 }
 
 // fetchHistory keeps paging past reactions, membership events, and other
@@ -348,10 +353,11 @@ func (m *chatModel) loadOlder() tea.Cmd {
 	m.loadingOlder[room] = true
 	requestVersion := m.roomRequestVersion
 	m.status = fmt.Sprintf("loading %d older messages…", historyPageSize)
-	return func() tea.Msg {
+	request := func() tea.Msg {
 		page, err := m.fetchHistory(room, from)
 		return olderLoadedMsg{room: room, page: page, requestVersion: requestVersion, err: err}
 	}
+	return tea.Batch(request, m.ensureLoadingTick())
 }
 
 func (m *chatModel) buildNavigator() {
@@ -506,6 +512,13 @@ func (m *chatModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 		m.threadView.Height = m.view.Height
 		m.input.Width = max(10, msg.Width-4)
 		m.refreshView()
+	case loadingTickMsg:
+		m.loadingFrame = (m.loadingFrame + 1) % len(loadingFrames)
+		if m.isLoading() {
+			return m, loadingTick()
+		}
+		m.loadingTicker = false
+		return m, nil
 	case incomingMsg:
 		if msg.ok {
 			m.storeIncoming(msg.message)
@@ -578,6 +591,7 @@ func (m *chatModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.requestVersion != m.roomRequestVersion {
 			return m, nil
 		}
+		m.roomLoading = false
 		if msg.err != nil {
 			m.status = "open room: " + msg.err.Error()
 			m.navigator = true
@@ -773,7 +787,7 @@ func (m *chatModel) queueMessage(room, thread, body string) tea.Cmd {
 	m.selection = max(0, len(m.visibleMessages())-1)
 	m.status = "sending…"
 	m.refreshView()
-	return m.sendMessage(room, thread, body, localID)
+	return tea.Batch(m.sendMessage(room, thread, body, localID), m.ensureLoadingTick())
 }
 
 func (m *chatModel) sendMessage(room, thread, body, localID string) tea.Cmd {
@@ -801,7 +815,7 @@ func (m *chatModel) retrySelected() tea.Cmd {
 	m.delivery[message.EventID] = deliverySending
 	m.status = "retrying…"
 	m.refreshView()
-	return m.sendMessage(message.RoomID, message.ThreadRoot, message.Body, message.EventID)
+	return tea.Batch(m.sendMessage(message.RoomID, message.ThreadRoot, message.Body, message.EventID), m.ensureLoadingTick())
 }
 
 func (m *chatModel) confirmLocalMessage(room, localID, eventID string) {
@@ -1194,7 +1208,7 @@ func (m *chatModel) navigatorView() string {
 		lines = append(lines, accountLine, "")
 	}
 	if m.navigatorLoading {
-		lines = append(lines, "Loading rooms and spaces…")
+		lines = append(lines, m.loadingText("Loading rooms and spaces…"))
 	} else if m.navigatorError != "" {
 		lines = append(lines, errorStyle.Render("Unable to load rooms and spaces"))
 	}
@@ -1236,7 +1250,7 @@ func (m *chatModel) navigatorView() string {
 	}
 	footer := fmt.Sprintf("%s open · %s accounts · %s notifications · %s help", m.keys.Key("open_thread"), m.keys.Key("switch_account"), m.keys.Key("notifications"), m.keys.Key("help"))
 	if m.status != "" {
-		footer = renderStatus(m.status)
+		footer = m.displayStatus()
 	}
 	body := strings.Join(lines, "\n")
 	if m.height > 0 {
@@ -1270,6 +1284,42 @@ func (m *chatModel) panel(title, content string, width int, active bool) string 
 	}
 	separatorWidth := max(8, width-2)
 	return sectionStyle.Render(title) + "\n" + dimStyle.Render(strings.Repeat("─", separatorWidth)) + "\n" + content
+}
+
+func (m *chatModel) isLoading() bool {
+	if m.navigatorLoading || m.roomLoading || m.loadingOlder[m.currentRoom] {
+		return true
+	}
+	for _, state := range m.delivery {
+		if state == deliverySending {
+			return true
+		}
+	}
+	return false
+}
+
+func (m *chatModel) ensureLoadingTick() tea.Cmd {
+	if m.loadingTicker {
+		return nil
+	}
+	m.loadingTicker = true
+	return loadingTick()
+}
+
+func (m *chatModel) loadingText(text string) string {
+	frame := 0
+	if len(loadingFrames) > 0 {
+		frame = m.loadingFrame % len(loadingFrames)
+	}
+	return loadingFrames[frame] + " " + text
+}
+
+func (m *chatModel) displayStatus() string {
+	status := m.status
+	if m.roomLoading || m.loadingOlder[m.currentRoom] || status == "sending…" || status == "retrying…" {
+		status = m.loadingText(status)
+	}
+	return renderStatus(status)
 }
 
 func renderStatus(status string) string {
@@ -1334,7 +1384,7 @@ func (m *chatModel) View() string {
 			status = fmt.Sprintf("%s room · %s", m.keys.Key("close_thread"), status)
 		}
 	} else {
-		status = renderStatus(status)
+		status = m.displayStatus()
 	}
 	content := m.panel("Room", m.view.View(), max(24, m.width-2), true)
 	if m.thread != "" {

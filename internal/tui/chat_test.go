@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/viewport"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
 	"matrix-cli/internal/config"
 	"matrix-cli/internal/matrix"
@@ -45,6 +46,20 @@ func TestNavigatorGroupsHomeAndSpaces(t *testing.T) {
 	}
 	if strings.Contains(view, "Public but not joined") {
 		t.Errorf("navigator showed an unjoined space child: %s", view)
+	}
+}
+
+func TestLoadingStatusUsesAnimatedSpinner(t *testing.T) {
+	model := &chatModel{
+		status:       "loading 10 older messages…",
+		currentRoom:  "!room:test",
+		loadingOlder: map[string]bool{"!room:test": true},
+	}
+	first := ansi.Strip(model.displayStatus())
+	_, cmd := model.Update(loadingTickMsg{})
+	second := ansi.Strip(model.displayStatus())
+	if cmd == nil || first == second || !strings.Contains(second, "loading 10 older messages") {
+		t.Fatalf("spinner did not advance: first=%q second=%q cmd=%v", first, second, cmd)
 	}
 }
 
@@ -172,6 +187,25 @@ func (*sendTestClient) Subscribe(context.Context, string) (<-chan matrix.Message
 }
 func (*sendTestClient) Logout(context.Context) error { return nil }
 
+func runSentCommand(t *testing.T, cmd tea.Cmd) sentMsg {
+	t.Helper()
+	message := cmd()
+	if sent, ok := message.(sentMsg); ok {
+		return sent
+	}
+	if batch, ok := message.(tea.BatchMsg); ok {
+		for _, batched := range batch {
+			if result := batched(); result != nil {
+				if sent, ok := result.(sentMsg); ok {
+					return sent
+				}
+			}
+		}
+	}
+	t.Fatalf("command returned no sentMsg: %T", message)
+	return sentMsg{}
+}
+
 func TestSendIsOptimisticAndFailedMessageCanBeRetried(t *testing.T) {
 	client := &sendTestClient{err: errors.New("offline")}
 	model := threadTestModel(config.Config{})
@@ -188,7 +222,7 @@ func TestSendIsOptimisticAndFailedMessageCanBeRetried(t *testing.T) {
 		t.Fatalf("message was not shown optimistically: messages=%#v delivery=%#v", visible, model.delivery)
 	}
 	localID := visible[0].EventID
-	_, _ = model.Update(cmd().(sentMsg))
+	_, _ = model.Update(runSentCommand(t, cmd))
 	if model.delivery[localID] != deliveryFailed || !strings.Contains(model.status, "retry") {
 		t.Fatalf("failed send state=%v status=%q", model.delivery[localID], model.status)
 	}
@@ -201,7 +235,7 @@ func TestSendIsOptimisticAndFailedMessageCanBeRetried(t *testing.T) {
 	if retry == nil || model.delivery[localID] != deliverySending {
 		t.Fatal("failed message could not be retried")
 	}
-	_, _ = model.Update(retry().(sentMsg))
+	_, _ = model.Update(runSentCommand(t, retry))
 	message := model.messages[model.currentRoom][0]
 	if message.EventID != "$sent" || model.delivery[message.EventID] != deliverySent || client.calls != 2 {
 		t.Fatalf("retry result: message=%#v delivery=%#v calls=%d", message, model.delivery, client.calls)
