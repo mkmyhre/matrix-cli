@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -122,7 +124,7 @@ func TestThreadSplitViewCanBeEnabled(t *testing.T) {
 }
 
 func TestMessageRenderingShortensSenderAndShowsTime(t *testing.T) {
-	output := renderMessages([]matrix.Message{{Sender: "@alice:example.com", Body: "hello", Timestamp: time.Date(2025, 1, 1, 12, 34, 0, 0, time.Local)}}, 0, true, 80)
+	output := renderMessages([]matrix.Message{{Sender: "@alice:example.com", Body: "hello", Timestamp: time.Date(2025, 1, 1, 12, 34, 0, 0, time.Local)}}, nil, 0, true, 80)
 	if !strings.Contains(output, "12:34") || !strings.Contains(output, "alice") || strings.Contains(output, "example.com") {
 		t.Fatalf("unexpected rendered message: %s", output)
 	}
@@ -131,7 +133,7 @@ func TestMessageRenderingShortensSenderAndShowsTime(t *testing.T) {
 func TestMessageRenderingWrapsInsteadOfClippingInThreadPane(t *testing.T) {
 	const width = 32
 	body := "A long thread reply with an unbroken-value-abcdefghijklmnopqrstuvwxyz0123456789 that must remain readable"
-	output := renderMessages([]matrix.Message{{Sender: "@alice:example.com", Body: body}}, 0, true, width)
+	output := renderMessages([]matrix.Message{{Sender: "@alice:example.com", Body: body}}, nil, 0, true, width)
 	for i, line := range strings.Split(output, "\n") {
 		if got := ansi.StringWidth(line); got > width {
 			t.Errorf("line %d width = %d, want <= %d: %q", i, got, width, ansi.Strip(line))
@@ -139,6 +141,80 @@ func TestMessageRenderingWrapsInsteadOfClippingInThreadPane(t *testing.T) {
 	}
 	if !strings.Contains(ansi.Strip(output), "must remain readable") {
 		t.Fatalf("end of wrapped message is missing: %s", output)
+	}
+}
+
+type sendTestClient struct {
+	err   error
+	calls int
+}
+
+func (*sendTestClient) Rooms(context.Context) ([]matrix.Room, error)   { return nil, nil }
+func (*sendTestClient) Spaces(context.Context) ([]matrix.Space, error) { return nil, nil }
+func (*sendTestClient) RoomInfo(context.Context, string) (matrix.RoomInfo, error) {
+	return matrix.RoomInfo{}, nil
+}
+func (*sendTestClient) RecentMessages(context.Context, string, string, int) (matrix.MessagePage, error) {
+	return matrix.MessagePage{}, nil
+}
+func (c *sendTestClient) Send(context.Context, string, string) (string, error) {
+	c.calls++
+	if c.err != nil {
+		return "", c.err
+	}
+	return "$sent", nil
+}
+func (c *sendTestClient) SendThread(context.Context, string, string, string) (string, error) {
+	return c.Send(context.Background(), "", "")
+}
+func (*sendTestClient) Subscribe(context.Context, string) (<-chan matrix.Message, <-chan error) {
+	return nil, nil
+}
+func (*sendTestClient) Logout(context.Context) error { return nil }
+
+func TestSendIsOptimisticAndFailedMessageCanBeRetried(t *testing.T) {
+	client := &sendTestClient{err: errors.New("offline")}
+	model := threadTestModel(config.Config{})
+	model.client = client
+	model.ctx = context.Background()
+	model.thread = ""
+	model.messages[model.currentRoom] = nil
+	model.delivery = make(map[string]deliveryState)
+	model.input.SetValue("hello")
+
+	cmd := model.sendCurrent()
+	visible := model.visibleMessages()
+	if cmd == nil || len(visible) != 1 || visible[0].Body != "hello" || model.delivery[visible[0].EventID] != deliverySending {
+		t.Fatalf("message was not shown optimistically: messages=%#v delivery=%#v", visible, model.delivery)
+	}
+	localID := visible[0].EventID
+	_, _ = model.Update(cmd().(sentMsg))
+	if model.delivery[localID] != deliveryFailed || !strings.Contains(model.status, "retry") {
+		t.Fatalf("failed send state=%v status=%q", model.delivery[localID], model.status)
+	}
+	if model.input.Value() != "" || model.messages[model.currentRoom][0].Body != "hello" {
+		t.Fatal("failed message text was not retained in the timeline")
+	}
+
+	client.err = nil
+	retry := model.retrySelected()
+	if retry == nil || model.delivery[localID] != deliverySending {
+		t.Fatal("failed message could not be retried")
+	}
+	_, _ = model.Update(retry().(sentMsg))
+	message := model.messages[model.currentRoom][0]
+	if message.EventID != "$sent" || model.delivery[message.EventID] != deliverySent || client.calls != 2 {
+		t.Fatalf("retry result: message=%#v delivery=%#v calls=%d", message, model.delivery, client.calls)
+	}
+}
+
+func TestIncomingEchoConfirmsOptimisticMessageWithoutDuplicate(t *testing.T) {
+	model := threadTestModel(config.Config{})
+	model.messages[model.currentRoom] = []matrix.Message{{RoomID: model.currentRoom, EventID: "$sent", Body: "hello"}}
+	model.delivery = map[string]deliveryState{"$sent": deliverySent}
+	model.storeIncoming(matrix.Message{RoomID: model.currentRoom, EventID: "$sent", Sender: "@me:test", Body: "hello"})
+	if len(model.messages[model.currentRoom]) != 1 || model.delivery["$sent"] != 0 {
+		t.Fatalf("sync echo was duplicated: messages=%#v delivery=%#v", model.messages[model.currentRoom], model.delivery)
 	}
 }
 
@@ -242,8 +318,9 @@ func TestOpeningRoomReplacesStaleHistoryWithLatestPage(t *testing.T) {
 		{EventID: "$new-2", Body: "new 2", Timestamp: base.Add(3 * time.Minute)},
 	}
 	_, _ = model.Update(roomLoadedMsg{
-		info: matrix.RoomInfo{Room: matrix.Room{ID: "!room:test"}},
-		page: matrix.MessagePage{Messages: latest, Next: "next"},
+		info:           matrix.RoomInfo{Room: matrix.Room{ID: "!room:test"}},
+		page:           matrix.MessagePage{Messages: latest, Next: "next"},
+		previousEvents: map[string]bool{"$old-1": true, "$old-2": true},
 	})
 
 	got := model.messages["!room:test"]
@@ -256,16 +333,40 @@ func TestOpeningRoomReplacesStaleHistoryWithLatestPage(t *testing.T) {
 }
 
 func TestOpeningRoomPreservesLiveMessageReceivedDuringHistoryFetch(t *testing.T) {
-	base := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
-	recent := []matrix.Message{{EventID: "$recent", Timestamp: base}}
+	recent := []matrix.Message{{EventID: "$recent"}}
 	cached := []matrix.Message{
-		{EventID: "$stale", Timestamp: base.Add(-time.Minute)},
-		{EventID: "$recent", Timestamp: base},
-		{EventID: "$live", Timestamp: base.Add(time.Minute)},
+		{EventID: "$stale"},
+		{EventID: "$recent"},
+		// A live event can have a missing or skewed timestamp, so request-time
+		// event IDs rather than timestamps determine whether it is retained.
+		{EventID: "$live"},
 	}
-	got := replaceWithRecentMessages(recent, cached)
+	got := replaceWithRecentMessages(recent, cached, map[string]bool{"$stale": true, "$recent": true})
 	if len(got) != 2 || got[0].EventID != "$recent" || got[1].EventID != "$live" {
 		t.Fatalf("replaced history = %#v", got)
+	}
+}
+
+func TestOpeningEmptyRoomHistoryStillPreservesLiveMessage(t *testing.T) {
+	got := replaceWithRecentMessages(nil, []matrix.Message{{EventID: "$old"}, {EventID: "$live"}}, map[string]bool{"$old": true})
+	if len(got) != 1 || got[0].EventID != "$live" {
+		t.Fatalf("replaced history = %#v, want live event", got)
+	}
+}
+
+func TestStaleRoomLoadCannotReplaceNewerNavigation(t *testing.T) {
+	model := &chatModel{
+		roomRequestVersion: 2,
+		currentRoom:        "!new:test",
+		messages:           map[string][]matrix.Message{"!new:test": {{EventID: "$new"}}},
+	}
+	_, _ = model.Update(roomLoadedMsg{
+		requestVersion: 1,
+		info:           matrix.RoomInfo{Room: matrix.Room{ID: "!old:test"}},
+		page:           matrix.MessagePage{Messages: []matrix.Message{{EventID: "$old"}}},
+	})
+	if model.currentRoom != "!new:test" || len(model.messages["!old:test"]) != 0 {
+		t.Fatalf("stale load changed room state: current=%q messages=%#v", model.currentRoom, model.messages)
 	}
 }
 

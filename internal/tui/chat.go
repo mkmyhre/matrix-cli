@@ -22,7 +22,18 @@ type incomingMsg struct {
 	ok      bool
 }
 type streamErrMsg struct{ err error }
-type sentMsg struct{ err error }
+type sentMsg struct {
+	room, localID, eventID string
+	err                    error
+}
+type deliveryState int
+
+const (
+	deliverySending deliveryState = iota + 1
+	deliverySent
+	deliveryFailed
+)
+
 type clearStatusMsg struct{ version int }
 type accountNotificationMsg struct {
 	notification AccountNotification
@@ -68,14 +79,17 @@ type AccountSwitcher struct {
 	SetDefault           func(string) error
 }
 type roomLoadedMsg struct {
-	info matrix.RoomInfo
-	page matrix.MessagePage
-	err  error
+	info           matrix.RoomInfo
+	page           matrix.MessagePage
+	requestVersion int
+	previousEvents map[string]bool
+	err            error
 }
 type olderLoadedMsg struct {
-	room string
-	page matrix.MessagePage
-	err  error
+	room           string
+	page           matrix.MessagePage
+	requestVersion int
+	err            error
 }
 type navigatorLoadedMsg struct {
 	rooms  []matrix.Room
@@ -118,8 +132,11 @@ type chatModel struct {
 	currentRoom          string
 	roomInfo             matrix.RoomInfo
 	messages             map[string][]matrix.Message
+	delivery             map[string]deliveryState
+	localMessageSequence int
 	nextPage             map[string]string
 	loadingOlder         map[string]bool
+	roomRequestVersion   int
 	unread               map[string]int
 	selection            int
 	rootSelection        int
@@ -179,7 +196,7 @@ func run(ctx context.Context, client matrix.API, initialRoom string, cfg config.
 	model := &chatModel{
 		ctx: ctx, client: client, keys: cfg, incoming: incoming, errors: errs,
 		input: input, view: viewport.New(80, 20), threadView: viewport.New(40, 20), navView: viewport.New(80, 20), navigatorLoading: true,
-		messages: make(map[string][]matrix.Message), nextPage: make(map[string]string),
+		messages: make(map[string][]matrix.Message), delivery: make(map[string]deliveryState), nextPage: make(map[string]string),
 		loadingOlder: make(map[string]bool), unread: make(map[string]int), navigator: initialRoom == "",
 		accountName: switcher.Current, accountColor: cfg.Color, accounts: switcher.Accounts, setDefaultAccount: switcher.SetDefault,
 		accountNotifications: switcher.Notifications, accountUnread: make(map[string]int),
@@ -272,13 +289,30 @@ func (m *chatModel) loadNavigator() tea.Cmd {
 }
 
 func (m *chatModel) loadRoom(room string) tea.Cmd {
+	// Room loads can overlap when Enter is pressed twice or a notification is
+	// opened while another request is running. Tag each request so a slower,
+	// older response cannot navigate the UI back to the wrong room.
+	m.roomRequestVersion++
+	requestVersion := m.roomRequestVersion
+	if m.loadingOlder == nil {
+		m.loadingOlder = make(map[string]bool)
+	}
+	m.loadingOlder[room] = false
+	previousEvents := make(map[string]bool)
+	for _, messages := range m.messages {
+		for _, message := range messages {
+			if message.EventID != "" {
+				previousEvents[message.EventID] = true
+			}
+		}
+	}
 	return func() tea.Msg {
 		info, err := m.client.RoomInfo(m.ctx, room)
 		if err != nil {
-			return roomLoadedMsg{err: err}
+			return roomLoadedMsg{requestVersion: requestVersion, err: err}
 		}
 		page, err := m.fetchHistory(info.ID, "")
-		return roomLoadedMsg{info: info, page: page, err: err}
+		return roomLoadedMsg{info: info, page: page, requestVersion: requestVersion, previousEvents: previousEvents, err: err}
 	}
 }
 
@@ -312,10 +346,11 @@ func (m *chatModel) loadOlder() tea.Cmd {
 		return nil
 	}
 	m.loadingOlder[room] = true
+	requestVersion := m.roomRequestVersion
 	m.status = fmt.Sprintf("loading %d older messages…", historyPageSize)
 	return func() tea.Msg {
 		page, err := m.fetchHistory(room, from)
-		return olderLoadedMsg{room: room, page: page, err: err}
+		return olderLoadedMsg{room: room, page: page, requestVersion: requestVersion, err: err}
 	}
 }
 
@@ -442,6 +477,8 @@ func (m *chatModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 			m.refreshView()
 		case m.keys.Key("load_older"):
 			return m, m.loadOlder()
+		case m.keys.Key("retry_send"):
+			return m, m.retrySelected()
 		case m.keys.Key("toggle_identifiers"):
 			m.showIDs = !m.showIDs
 		case m.keys.Key("close_thread"):
@@ -456,7 +493,7 @@ func (m *chatModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case m.keys.Key("open_thread"):
 			visible := m.visibleMessages()
-			if m.thread == "" && m.selection >= 0 && m.selection < len(visible) && visible[m.selection].EventID != "" {
+			if m.thread == "" && m.selection >= 0 && m.selection < len(visible) && visible[m.selection].EventID != "" && m.delivery[visible[m.selection].EventID] == 0 {
 				m.rootSelection = m.selection
 				m.thread = visible[m.selection].EventID
 				m.selection = max(0, len(m.visibleMessages())-1)
@@ -471,7 +508,7 @@ func (m *chatModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshView()
 	case incomingMsg:
 		if msg.ok {
-			m.messages[msg.message.RoomID] = append(m.messages[msg.message.RoomID], msg.message)
+			m.storeIncoming(msg.message)
 			visibleHere := msg.message.RoomID == m.currentRoom && !m.navigator
 			if m.thread == "" && msg.message.ThreadRoot != "" {
 				visibleHere = false
@@ -510,8 +547,16 @@ func (m *chatModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case sentMsg:
 		if msg.err != nil {
-			m.status = "send error: " + msg.err.Error()
+			m.delivery[msg.localID] = deliveryFailed
+			m.status = "send failed: " + msg.err.Error() + " · select it and press " + m.keys.Key("retry_send") + " to retry"
+			if msg.room == m.currentRoom {
+				m.refreshView()
+			}
 			return m, nil
+		}
+		m.confirmLocalMessage(msg.room, msg.localID, msg.eventID)
+		if msg.room == m.currentRoom {
+			m.refreshView()
 		}
 		return m, m.setTransientStatus("sent", 2*time.Second)
 	case navigatorLoadedMsg:
@@ -530,6 +575,9 @@ func (m *chatModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = ""
 		}
 	case roomLoadedMsg:
+		if msg.requestVersion != m.roomRequestVersion {
+			return m, nil
+		}
 		if msg.err != nil {
 			m.status = "open room: " + msg.err.Error()
 			m.navigator = true
@@ -537,25 +585,32 @@ func (m *chatModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.roomInfo = msg.info
 		m.currentRoom = msg.info.ID
+		if m.loadingOlder == nil {
+			m.loadingOlder = make(map[string]bool)
+		}
+		m.loadingOlder[msg.info.ID] = false
 		delete(m.unread, msg.info.ID)
 		// Opening a room starts a new history window. Keeping the old cache after
 		// the newly fetched page puts stale messages after the latest page, so the
 		// selection lands on what used to be the newest message. Only retain live
 		// events that arrived while this history request was in flight.
-		m.messages[msg.info.ID] = replaceWithRecentMessages(msg.page.Messages, m.messages[msg.info.ID])
+		m.messages[msg.info.ID] = replaceWithRecentMessages(msg.page.Messages, m.messages[msg.info.ID], msg.previousEvents)
 		m.nextPage[msg.info.ID] = msg.page.Next
 		m.thread = ""
 		m.rootSelection = 0
 		m.selection = max(0, len(m.visibleMessages())-1)
 		m.navigator = false
 		m.mode = normalMode
-		if len(msg.page.Messages) == 0 {
+		if len(m.messages[msg.info.ID]) == 0 {
 			m.status = "no message history available"
 		} else {
 			m.status = ""
 		}
 		m.refreshView()
 	case olderLoadedMsg:
+		if msg.requestVersion != m.roomRequestVersion {
+			return m, nil
+		}
 		m.loadingOlder[msg.room] = false
 		if msg.err != nil {
 			m.status = "load history: " + msg.err.Error()
@@ -701,14 +756,92 @@ func (m *chatModel) sendCurrent() tea.Cmd {
 		return nil
 	}
 	m.input.SetValue("")
-	m.status = "sending…"
-	thread, room := m.thread, m.currentRoom
-	return func() tea.Msg {
-		if thread != "" {
-			return sentMsg{err: m.client.SendThread(m.ctx, room, thread, body)}
-		}
-		return sentMsg{err: m.client.Send(m.ctx, room, body)}
+	return m.queueMessage(m.currentRoom, m.thread, body)
+}
+
+func (m *chatModel) queueMessage(room, thread, body string) tea.Cmd {
+	if m.delivery == nil {
+		m.delivery = make(map[string]deliveryState)
 	}
+	m.localMessageSequence++
+	localID := fmt.Sprintf("~local-%d", m.localMessageSequence)
+	m.messages[room] = append(m.messages[room], matrix.Message{
+		RoomID: room, Sender: "@you:local", Body: body, EventID: localID,
+		ThreadRoot: thread, Timestamp: time.Now(),
+	})
+	m.delivery[localID] = deliverySending
+	m.selection = max(0, len(m.visibleMessages())-1)
+	m.status = "sending…"
+	m.refreshView()
+	return m.sendMessage(room, thread, body, localID)
+}
+
+func (m *chatModel) sendMessage(room, thread, body, localID string) tea.Cmd {
+	return func() tea.Msg {
+		var eventID string
+		var err error
+		if thread != "" {
+			eventID, err = m.client.SendThread(m.ctx, room, thread, body)
+		} else {
+			eventID, err = m.client.Send(m.ctx, room, body)
+		}
+		return sentMsg{room: room, localID: localID, eventID: eventID, err: err}
+	}
+}
+
+func (m *chatModel) retrySelected() tea.Cmd {
+	visible := m.visibleMessages()
+	if m.selection < 0 || m.selection >= len(visible) {
+		return nil
+	}
+	message := visible[m.selection]
+	if m.delivery[message.EventID] != deliveryFailed {
+		return nil
+	}
+	m.delivery[message.EventID] = deliverySending
+	m.status = "retrying…"
+	m.refreshView()
+	return m.sendMessage(message.RoomID, message.ThreadRoot, message.Body, message.EventID)
+}
+
+func (m *chatModel) confirmLocalMessage(room, localID, eventID string) {
+	state := deliverySent
+	if eventID == "" {
+		m.delivery[localID] = state
+		return
+	}
+	messages := m.messages[room]
+	serverIndex, localIndex := -1, -1
+	for i := range messages {
+		if messages[i].EventID == eventID {
+			serverIndex = i
+		}
+		if messages[i].EventID == localID {
+			localIndex = i
+		}
+	}
+	delete(m.delivery, localID)
+	if localIndex < 0 {
+		return
+	}
+	if serverIndex >= 0 && serverIndex != localIndex {
+		m.messages[room] = append(messages[:localIndex], messages[localIndex+1:]...)
+		return
+	}
+	m.messages[room][localIndex].EventID = eventID
+	m.delivery[eventID] = state
+}
+
+func (m *chatModel) storeIncoming(message matrix.Message) {
+	messages := m.messages[message.RoomID]
+	for i := range messages {
+		if message.EventID != "" && messages[i].EventID == message.EventID {
+			messages[i] = message
+			delete(m.delivery, message.EventID)
+			return
+		}
+	}
+	m.messages[message.RoomID] = append(messages, message)
 }
 
 func mergeMessages(first, second []matrix.Message) []matrix.Message {
@@ -729,37 +862,24 @@ func mergeMessages(first, second []matrix.Message) []matrix.Message {
 	return merged
 }
 
-// replaceWithRecentMessages discards a room's previous history window while
-// preserving events newer than the fetched page. Such events may have arrived
-// from /sync while the /messages request was in flight.
-func replaceWithRecentMessages(recent, cached []matrix.Message) []matrix.Message {
+// replaceWithRecentMessages discards events that were already cached when the
+// history request started, while preserving events delivered by /sync during
+// the request. Using event IDs rather than timestamps also handles empty pages,
+// missing timestamps, and homeserver clock skew.
+func replaceWithRecentMessages(recent, cached []matrix.Message, previousEvents map[string]bool) []matrix.Message {
 	result := append([]matrix.Message(nil), recent...)
-	if len(recent) == 0 {
-		return result
-	}
 	seen := make(map[string]bool, len(recent))
-	var newest time.Time
 	for _, msg := range recent {
 		if msg.EventID != "" {
 			seen[msg.EventID] = true
 		}
-		if msg.Timestamp.After(newest) {
-			newest = msg.Timestamp
-		}
-	}
-	if newest.IsZero() {
-		return result
 	}
 	for _, msg := range cached {
-		if msg.EventID != "" && seen[msg.EventID] {
+		if msg.EventID == "" || previousEvents[msg.EventID] || seen[msg.EventID] {
 			continue
 		}
-		if msg.Timestamp.After(newest) {
-			result = append(result, msg)
-			if msg.EventID != "" {
-				seen[msg.EventID] = true
-			}
-		}
+		result = append(result, msg)
+		seen[msg.EventID] = true
 	}
 	return result
 }
@@ -856,7 +976,7 @@ func wrapMessageBody(body string, width int) []string {
 	return strings.Split(body, "\n")
 }
 
-func renderMessages(messages []matrix.Message, selected int, active bool, width int) string {
+func renderMessages(messages []matrix.Message, delivery map[string]deliveryState, selected int, active bool, width int) string {
 	lines := make([]string, 0, len(messages))
 	for i, msg := range messages {
 		stamp := "     "
@@ -864,6 +984,15 @@ func renderMessages(messages []matrix.Message, selected int, active bool, width 
 			stamp = msg.Timestamp.Local().Format("15:04")
 		}
 		rawHeader := fmt.Sprintf("%s  %-14s ", stamp, shortSender(msg.Sender))
+		body := msg.Body
+		switch delivery[msg.EventID] {
+		case deliverySending:
+			body += dimStyle.Render("  sending…")
+		case deliverySent:
+			body += successStyle.Render("  ✓")
+		case deliveryFailed:
+			body += errorStyle.Render("  failed · retry")
+		}
 		header := dimStyle.Render(rawHeader)
 		headerWidth := lipgloss.Width(rawHeader)
 		contentWidth := width - 2 // selection marker or normal outer indent
@@ -874,7 +1003,7 @@ func renderMessages(messages []matrix.Message, selected int, active bool, width 
 			msgLines = append(msgLines, dimStyle.Render(strings.TrimRight(rawHeader, " ")))
 			// Leave room for the selection bar, outer indent, and indented body.
 			bodyWidth := max(1, contentWidth-4)
-			for _, bodyLine := range wrapMessageBody(msg.Body, bodyWidth) {
+			for _, bodyLine := range wrapMessageBody(body, bodyWidth) {
 				msgLines = append(msgLines, "  "+bodyLine)
 			}
 		} else {
@@ -882,7 +1011,7 @@ func renderMessages(messages []matrix.Message, selected int, active bool, width 
 			if width > 0 {
 				bodyWidth = max(1, contentWidth-headerWidth)
 			}
-			bodyLines := wrapMessageBody(msg.Body, bodyWidth)
+			bodyLines := wrapMessageBody(body, bodyWidth)
 			if len(bodyLines) == 0 {
 				bodyLines = []string{""}
 			}
@@ -914,7 +1043,7 @@ func (m *chatModel) refreshView() {
 		}
 		m.view.Width = max(20, m.width-6)
 		m.view.Height = max(3, m.height-9)
-		m.view.SetContent(renderMessages(main, m.selection, m.mode == normalMode, m.view.Width))
+		m.view.SetContent(renderMessages(main, m.delivery, m.selection, m.mode == normalMode, m.view.Width))
 		m.view.GotoBottom()
 		return
 	}
@@ -927,7 +1056,7 @@ func (m *chatModel) refreshView() {
 	if m.keys.EffectiveThreadView() == config.ThreadViewFocused {
 		m.view.Width = max(20, m.width-6)
 		m.view.Height = max(3, m.height-9)
-		m.view.SetContent(renderMessages(thread, m.selection, m.mode == normalMode, m.view.Width))
+		m.view.SetContent(renderMessages(thread, m.delivery, m.selection, m.mode == normalMode, m.view.Width))
 		m.view.GotoBottom()
 		return
 	}
@@ -947,8 +1076,8 @@ func (m *chatModel) refreshView() {
 	}
 	m.view.Width = max(16, columnWidth-4)
 	m.threadView.Width = max(16, columnWidth-4)
-	m.view.SetContent(renderMessages(main, m.rootSelection, false, m.view.Width))
-	m.threadView.SetContent(renderMessages(thread, m.selection, m.mode == normalMode, m.threadView.Width))
+	m.view.SetContent(renderMessages(main, m.delivery, m.rootSelection, false, m.view.Width))
+	m.threadView.SetContent(renderMessages(thread, m.delivery, m.selection, m.mode == normalMode, m.threadView.Width))
 	m.view.GotoBottom()
 	m.threadView.GotoBottom()
 }
@@ -1144,7 +1273,7 @@ func (m *chatModel) panel(title, content string, width int, active bool) string 
 }
 
 func renderStatus(status string) string {
-	if strings.Contains(status, "error") {
+	if strings.Contains(status, "error") || strings.Contains(status, "failed") {
 		return errorStyle.Render(status)
 	}
 	if status == "sent" || strings.HasPrefix(status, "loaded") {

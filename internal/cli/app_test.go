@@ -122,13 +122,13 @@ func (f *fakeMatrix) RoomInfo(context.Context, string) (matrix.RoomInfo, error) 
 func (f *fakeMatrix) RecentMessages(context.Context, string, string, int) (matrix.MessagePage, error) {
 	return matrix.MessagePage{}, nil
 }
-func (f *fakeMatrix) Send(_ context.Context, room, body string) error {
+func (f *fakeMatrix) Send(_ context.Context, room, body string) (string, error) {
 	f.sentRoom, f.sentBody = room, body
-	return nil
+	return "$sent", nil
 }
-func (f *fakeMatrix) SendThread(_ context.Context, room, _ string, body string) error {
+func (f *fakeMatrix) SendThread(_ context.Context, room, _ string, body string) (string, error) {
 	f.sentRoom, f.sentBody = room, body
-	return nil
+	return "$sent", nil
 }
 func (f *fakeMatrix) Subscribe(context.Context, string) (<-chan matrix.Message, <-chan error) {
 	if f.messages != nil || f.streamErrors != nil {

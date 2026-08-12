@@ -760,7 +760,8 @@ func (a *App) sendCommand() *cobra.Command {
 		if err != nil {
 			return err
 		}
-		return client.Send(cmd.Context(), args[0], strings.Join(args[1:], " "))
+		_, err = client.Send(cmd.Context(), args[0], strings.Join(args[1:], " "))
+		return err
 	}}
 }
 

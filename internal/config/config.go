@@ -50,6 +50,7 @@ var DefaultKeybindings = map[string]string{
 	"notifications":       "n",
 	"toggle_identifiers":  "v",
 	"quit":                "q",
+	"retry_send":          "r",
 	"send":                "enter",
 }
 

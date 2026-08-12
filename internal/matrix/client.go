@@ -51,8 +51,8 @@ type API interface {
 	Spaces(context.Context) ([]Space, error)
 	RoomInfo(context.Context, string) (RoomInfo, error)
 	RecentMessages(context.Context, string, string, int) (MessagePage, error)
-	Send(context.Context, string, string) error
-	SendThread(context.Context, string, string, string) error
+	Send(context.Context, string, string) (string, error)
+	SendThread(context.Context, string, string, string) (string, error)
 	Subscribe(context.Context, string) (<-chan Message, <-chan error)
 	Logout(context.Context) error
 }
@@ -328,30 +328,36 @@ func (c *Client) prepareRoomEncryption(ctx context.Context, roomID id.RoomID) er
 	return nil
 }
 
-func (c *Client) Send(ctx context.Context, room, body string) error {
+func (c *Client) Send(ctx context.Context, room, body string) (string, error) {
 	roomID, err := c.resolveRoom(ctx, room)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if err = c.prepareRoomEncryption(ctx, roomID); err != nil {
-		return err
+		return "", err
 	}
-	_, err = c.raw.SendText(ctx, roomID, body)
-	return err
+	response, err := c.raw.SendText(ctx, roomID, body)
+	if err != nil {
+		return "", err
+	}
+	return response.EventID.String(), nil
 }
 
-func (c *Client) SendThread(ctx context.Context, room, rootEventID, body string) error {
+func (c *Client) SendThread(ctx context.Context, room, rootEventID, body string) (string, error) {
 	roomID, err := c.resolveRoom(ctx, room)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if err = c.prepareRoomEncryption(ctx, roomID); err != nil {
-		return err
+		return "", err
 	}
 	content := &event.MessageEventContent{MsgType: event.MsgText, Body: body, RelatesTo: &event.RelatesTo{}}
 	content.RelatesTo.SetThread(id.EventID(rootEventID), id.EventID(rootEventID))
-	_, err = c.raw.SendMessageEvent(ctx, roomID, event.EventMessage, content)
-	return err
+	response, err := c.raw.SendMessageEvent(ctx, roomID, event.EventMessage, content)
+	if err != nil {
+		return "", err
+	}
+	return response.EventID.String(), nil
 }
 
 func (c *Client) RecentMessages(ctx context.Context, room, from string, limit int) (MessagePage, error) {

@@ -213,9 +213,10 @@ Chat starts in a normal mode inspired by Neovim:
 - `j` / `k`: select the next/previous message; `k` at the top loads an older page
 - `Ctrl+U`: load up to 10 older messages
 - `Enter`: open the selected message's thread in a focused full-width view
+- `r`: retry the selected message when sending failed
 - `Esc`: close the current thread; press again to open the room/space navigator
 - `i`: enter insert mode
-- `Enter`: send from insert mode
+- `Enter`: send from insert mode; the message appears immediately with delivery status
 - `Esc`: return to normal mode
 - `a`: open the local account picker
 - `n`: open the cross-account notification inbox
