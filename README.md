@@ -3,7 +3,17 @@
 A small Matrix CLI with named accounts, optional end-to-end encryption,
 regular subcommands, and live terminal modes.
 
+> [!IMPORTANT]
+> This project is mainly generated with AI assistance, primarily using Claude
+> Fable 5 and GPT-5.6-sol. Expect mistakes and review the code before relying on
+> it, especially for security-sensitive use.
+
+This is an independent community project. It is not affiliated with or endorsed
+by the Matrix.org Foundation.
+
 ## Install
+
+Building from source requires Go 1.24.4 or newer. `make` is optional.
 
 Using the Makefile:
 
@@ -326,3 +336,14 @@ session produces an account-specific sign-in command, for example
 `matrix --ac work login`; saved connection and authentication settings are
 reused. For local/containerized servers, persist the homeserver database:
 recreating it invalidates saved tokens and Matrix device state.
+
+## Contributing
+
+Bug reports and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md)
+for the development workflow. Report security vulnerabilities according to
+[SECURITY.md](SECURITY.md), not in a public issue.
+
+## License
+
+Licensed under the [GNU General Public License v3.0 only](LICENSE)
+(`GPL-3.0-only`).
