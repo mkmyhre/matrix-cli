@@ -129,6 +129,49 @@ func TestSpacesExcludeAccessibleButUnjoinedChildren(t *testing.T) {
 	}
 }
 
+func TestSendRejectsEncryptedRoomWithoutCrypto(t *testing.T) {
+	tests := []struct {
+		name string
+		send func(*Client) error
+	}{
+		{name: "message", send: func(client *Client) error {
+			_, err := client.Send(context.Background(), "!room:test", "secret")
+			return err
+		}},
+		{name: "thread", send: func(client *Client) error {
+			_, err := client.SendThread(context.Background(), "!room:test", "$root", "secret")
+			return err
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			sendCalled := false
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if strings.HasSuffix(r.URL.Path, "/state") {
+					_, _ = w.Write([]byte(`[{"type":"m.room.encryption","state_key":"","content":{"algorithm":"m.megolm.v1.aes-sha2"}}]`))
+					return
+				}
+				sendCalled = true
+				http.Error(w, "message must not be sent", http.StatusInternalServerError)
+			}))
+			defer server.Close()
+
+			client, err := New(server.URL, "@me:test", "DEV", "token")
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = tc.send(client)
+			if err == nil || !strings.Contains(err.Error(), "end-to-end encrypted") || !strings.Contains(err.Error(), "-tags goolm") {
+				t.Fatalf("error = %v", err)
+			}
+			if sendCalled {
+				t.Fatal("plaintext send endpoint was called")
+			}
+		})
+	}
+}
+
 func TestMessageFromEvent(t *testing.T) {
 	evt := &event.Event{
 		Type: event.EventMessage, RoomID: id.RoomID("!room:test"), Sender: id.UserID("@alice:test"), ID: id.EventID("$event"), Timestamp: 1234,

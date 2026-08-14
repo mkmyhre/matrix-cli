@@ -37,21 +37,22 @@ type Config struct {
 }
 
 var DefaultKeybindings = map[string]string{
-	"help":                "?",
-	"insert_mode":         "i",
-	"load_older":          "ctrl+u",
-	"normal_mode":         "esc",
-	"move_down":           "j",
-	"move_up":             "k",
-	"open_thread":         "enter",
-	"close_thread":        "esc",
-	"switch_account":      "a",
-	"set_default_account": "d",
-	"notifications":       "n",
-	"toggle_identifiers":  "v",
-	"quit":                "q",
-	"retry_send":          "r",
-	"send":                "enter",
+	"help":                 "?",
+	"insert_mode":          "i",
+	"load_older":           "ctrl+u",
+	"normal_mode":          "esc",
+	"move_down":            "j",
+	"move_up":              "k",
+	"open_thread":          "enter",
+	"close_thread":         "esc",
+	"switch_account":       "a",
+	"set_default_account":  "d",
+	"notifications":        "n",
+	"discard_notification": "d",
+	"toggle_identifiers":   "v",
+	"quit":                 "q",
+	"retry_send":           "r",
+	"send":                 "enter",
 }
 
 func (c Config) Key(action string) string {
@@ -177,7 +178,7 @@ func (c Config) validateKeybindings() error {
 
 func compatibleKeybindingPair(first, second string) bool {
 	pair := first + ":" + second
-	return pair == "close_thread:normal_mode" || pair == "open_thread:send"
+	return pair == "close_thread:normal_mode" || pair == "discard_notification:set_default_account" || pair == "open_thread:send"
 }
 
 type Store interface {

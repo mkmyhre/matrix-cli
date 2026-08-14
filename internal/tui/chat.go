@@ -712,14 +712,14 @@ func (m *chatModel) updateNotificationPicker(key string) (tea.Model, tea.Cmd) {
 		}
 	case m.keys.Key("move_up"):
 		m.notificationIndex = max(0, m.notificationIndex-1)
+	case m.keys.Key("discard_notification"):
+		m.removeSelectedNotification()
 	case m.keys.Key("open_thread"):
 		if m.notificationIndex < 0 || m.notificationIndex >= len(m.notifications) {
 			return m, nil
 		}
 		notification := m.notifications[m.notificationIndex]
-		m.notifications = append(m.notifications[:m.notificationIndex], m.notifications[m.notificationIndex+1:]...)
-		m.accountUnread[notification.Account] = max(0, m.accountUnread[notification.Account]-1)
-		m.notificationIndex = min(m.notificationIndex, max(0, len(m.notifications)-1))
+		m.removeSelectedNotification()
 		if notification.Account == m.accountName {
 			m.notificationPicker = false
 			m.status = "loading " + notification.Message.RoomID + "…"
@@ -735,6 +735,16 @@ func (m *chatModel) updateNotificationPicker(key string) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	}
 	return m, nil
+}
+
+func (m *chatModel) removeSelectedNotification() {
+	if m.notificationIndex < 0 || m.notificationIndex >= len(m.notifications) {
+		return
+	}
+	notification := m.notifications[m.notificationIndex]
+	m.notifications = append(m.notifications[:m.notificationIndex], m.notifications[m.notificationIndex+1:]...)
+	m.accountUnread[notification.Account] = max(0, m.accountUnread[notification.Account]-1)
+	m.notificationIndex = min(m.notificationIndex, max(0, len(m.notifications)-1))
 }
 
 func (m *chatModel) updateNavigator(key string) (tea.Model, tea.Cmd) {
@@ -1193,7 +1203,7 @@ func (m *chatModel) notificationPickerView() string {
 	if len(lines) == 0 {
 		lines = append(lines, "  No new notifications while the TUI has been running.")
 	}
-	footer := fmt.Sprintf("%s/%s move · %s open · %s close", m.keys.Key("move_down"), m.keys.Key("move_up"), m.keys.Key("open_thread"), m.keys.Key("close_thread"))
+	footer := fmt.Sprintf("%s/%s move · %s open · %s discard · %s close", m.keys.Key("move_down"), m.keys.Key("move_up"), m.keys.Key("open_thread"), m.keys.Key("discard_notification"), m.keys.Key("close_thread"))
 	return m.panel(fmt.Sprintf("Notifications · %d", len(m.notifications)), strings.Join(lines, "\n"), max(24, m.width-2), true) + "\n" + dimStyle.Render(footer)
 }
 

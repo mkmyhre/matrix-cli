@@ -249,8 +249,9 @@ preventing other accounts from connecting.
 
 Press `n` to open the notification inbox. It keeps the latest 100 incoming
 messages in memory, tagged with account, room, sender, timestamp, and preview.
-Pressing `Enter` switches account when needed and opens the message's room. The
-inbox survives in-TUI account switches but is cleared when the program exits.
+Press `d` to discard the selected notification. Pressing `Enter` switches
+account when needed and opens the message's room. The inbox survives in-TUI
+account switches but is cleared when the program exits.
 The initial implementation tracks new messages received while the TUI is open;
 loading historical server unread counts and evaluating full Matrix push rules
 are planned follow-ups.

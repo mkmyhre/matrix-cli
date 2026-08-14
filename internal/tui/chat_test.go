@@ -315,6 +315,28 @@ func TestNotificationInboxNavigatesAcrossAccounts(t *testing.T) {
 	}
 }
 
+func TestNotificationInboxDiscardsSelectedNotification(t *testing.T) {
+	model := &chatModel{
+		keys: config.Config{}, notificationPicker: true, notificationIndex: 1,
+		accountUnread: map[string]int{"dev": 1, "prod": 2},
+		notifications: []AccountNotification{
+			{Account: "dev", Message: matrix.Message{RoomID: "!dev:test", Body: "keep"}},
+			{Account: "prod", Message: matrix.Message{RoomID: "!first:prod", Body: "discard"}},
+			{Account: "prod", Message: matrix.Message{RoomID: "!second:prod", Body: "keep"}},
+		},
+	}
+	_, cmd := model.updateNotificationPicker(model.keys.Key("discard_notification"))
+	if cmd != nil || len(model.notifications) != 2 || model.notifications[1].Message.Body != "keep" {
+		t.Fatalf("notifications = %#v, cmd=%v", model.notifications, cmd)
+	}
+	if model.accountUnread["prod"] != 1 || model.accountUnread["dev"] != 1 || model.notificationIndex != 1 {
+		t.Fatalf("unread=%#v index=%d", model.accountUnread, model.notificationIndex)
+	}
+	if !strings.Contains(ansi.Strip(model.notificationPickerView()), "d discard") {
+		t.Fatal("notification footer does not show discard binding")
+	}
+}
+
 func TestBackgroundOwnMessageIsNotANotification(t *testing.T) {
 	channel := make(chan AccountNotification)
 	model := &chatModel{

@@ -313,12 +313,15 @@ func (c *Client) resolveRoom(ctx context.Context, room string) (id.RoomID, error
 }
 
 func (c *Client) prepareRoomEncryption(ctx context.Context, roomID id.RoomID) error {
-	if c.crypto == nil {
-		return nil
-	}
 	state, err := c.raw.State(ctx, roomID)
 	if err != nil {
 		return fmt.Errorf("load room encryption state: %w", err)
+	}
+	if c.crypto == nil {
+		if _, encrypted := state[event.StateEncryption]; encrypted {
+			return errors.New("room is end-to-end encrypted; rebuild with `-tags goolm` to send messages")
+		}
+		return nil
 	}
 	for _, byStateKey := range state {
 		for _, evt := range byStateKey {
