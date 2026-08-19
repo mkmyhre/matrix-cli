@@ -139,7 +139,7 @@ func TestThreadSplitViewCanBeEnabled(t *testing.T) {
 }
 
 func TestMessageRenderingShortensSenderAndShowsTime(t *testing.T) {
-	output := renderMessages([]matrix.Message{{Sender: "@alice:example.com", Body: "hello", Timestamp: time.Date(2025, 1, 1, 12, 34, 0, 0, time.Local)}}, nil, 0, true, 80)
+	output := renderMessages([]matrix.Message{{Sender: "@alice:example.com", Body: "hello", Timestamp: time.Date(2025, 1, 1, 12, 34, 0, 0, time.Local)}}, nil, config.ReactionsOff, nil, 0, true, 80)
 	if !strings.Contains(output, "12:34") || !strings.Contains(output, "alice") || strings.Contains(output, "example.com") {
 		t.Fatalf("unexpected rendered message: %s", output)
 	}
@@ -148,7 +148,7 @@ func TestMessageRenderingShortensSenderAndShowsTime(t *testing.T) {
 func TestMessageRenderingWrapsInsteadOfClippingInThreadPane(t *testing.T) {
 	const width = 32
 	body := "A long thread reply with an unbroken-value-abcdefghijklmnopqrstuvwxyz0123456789 that must remain readable"
-	output := renderMessages([]matrix.Message{{Sender: "@alice:example.com", Body: body}}, nil, 0, true, width)
+	output := renderMessages([]matrix.Message{{Sender: "@alice:example.com", Body: body}}, nil, config.ReactionsOff, nil, 0, true, width)
 	for i, line := range strings.Split(output, "\n") {
 		if got := ansi.StringWidth(line); got > width {
 			t.Errorf("line %d width = %d, want <= %d: %q", i, got, width, ansi.Strip(line))
@@ -159,9 +159,44 @@ func TestMessageRenderingWrapsInsteadOfClippingInThreadPane(t *testing.T) {
 	}
 }
 
+func TestReactionRenderingCanBeLimitedOrDisabled(t *testing.T) {
+	reactions := map[string][]matrix.Reaction{"$message": {
+		{EventID: "$1", Key: "👍"}, {EventID: "$2", Key: "👍"}, {EventID: "$3", Key: "❤️"}, {EventID: "$4", Key: "🎉"}, {EventID: "$5", Key: "👀"},
+	}}
+	messages := []matrix.Message{{EventID: "$message", Body: "hello"}}
+	limited := ansi.Strip(renderMessages(messages, reactions, config.ReactionsLimited, nil, 0, true, 80))
+	if !strings.Contains(limited, "👍 2") || !strings.Contains(limited, "❤️ 1") || !strings.Contains(limited, "🎉 1") || strings.Contains(limited, "👀 1") {
+		t.Fatalf("limited reactions = %q", limited)
+	}
+	full := ansi.Strip(renderMessages(messages, reactions, config.ReactionsFull, nil, 0, true, 80))
+	if !strings.Contains(full, "👀 1") {
+		t.Fatalf("full reactions = %q", full)
+	}
+	off := ansi.Strip(renderMessages(messages, reactions, config.ReactionsOff, nil, 0, true, 80))
+	if strings.Contains(off, "👍 2") {
+		t.Fatalf("disabled reactions = %q", off)
+	}
+}
+
+func TestFetchHistoryRetainsReactions(t *testing.T) {
+	client := &sendTestClient{page: matrix.MessagePage{
+		Messages:  []matrix.Message{{EventID: "$message", Body: "hello"}},
+		Reactions: []matrix.Reaction{{EventID: "$reaction", TargetEventID: "$message", Key: "👍"}},
+	}}
+	model := &chatModel{ctx: context.Background(), client: client}
+	page, err := model.fetchHistory("!room:test", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Messages) != 1 || len(page.Reactions) != 1 || page.Reactions[0].Key != "👍" {
+		t.Fatalf("page = %#v", page)
+	}
+}
+
 type sendTestClient struct {
 	err   error
 	calls int
+	page  matrix.MessagePage
 }
 
 func (*sendTestClient) Rooms(context.Context) ([]matrix.Room, error)   { return nil, nil }
@@ -169,8 +204,8 @@ func (*sendTestClient) Spaces(context.Context) ([]matrix.Space, error) { return 
 func (*sendTestClient) RoomInfo(context.Context, string) (matrix.RoomInfo, error) {
 	return matrix.RoomInfo{}, nil
 }
-func (*sendTestClient) RecentMessages(context.Context, string, string, int) (matrix.MessagePage, error) {
-	return matrix.MessagePage{}, nil
+func (c *sendTestClient) RecentMessages(context.Context, string, string, int) (matrix.MessagePage, error) {
+	return c.page, nil
 }
 func (c *sendTestClient) Send(context.Context, string, string) (string, error) {
 	c.calls++
@@ -182,7 +217,10 @@ func (c *sendTestClient) Send(context.Context, string, string) (string, error) {
 func (c *sendTestClient) SendThread(context.Context, string, string, string) (string, error) {
 	return c.Send(context.Background(), "", "")
 }
-func (*sendTestClient) Subscribe(context.Context, string) (<-chan matrix.Message, <-chan error) {
+func (*sendTestClient) SendReaction(context.Context, string, string, string) (string, error) {
+	return "", nil
+}
+func (*sendTestClient) Subscribe(context.Context, string) (<-chan matrix.TimelineEvent, <-chan error) {
 	return nil, nil
 }
 func (*sendTestClient) Logout(context.Context) error { return nil }

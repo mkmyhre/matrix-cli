@@ -21,6 +21,9 @@ const (
 	AuthMethodSSO      = "sso"
 	ThemeMinimal       = "minimal"
 	ThemeBoxed         = "boxed"
+	ReactionsOff       = "off"
+	ReactionsLimited   = "limited"
+	ReactionsFull      = "full"
 )
 
 type Config struct {
@@ -33,6 +36,7 @@ type Config struct {
 	ThreadView    string            `json:"thread_view,omitempty"`
 	Color         string            `json:"color,omitempty"`
 	Theme         string            `json:"theme,omitempty"`
+	Reactions     string            `json:"reactions,omitempty"`
 	Keybindings   map[string]string `json:"keybindings,omitempty"`
 }
 
@@ -113,6 +117,13 @@ func (c Config) EffectiveThreadView() string {
 	return ThreadViewFocused
 }
 
+func (c Config) EffectiveReactions() string {
+	if c.Reactions == ReactionsLimited || c.Reactions == ReactionsFull {
+		return c.Reactions
+	}
+	return ReactionsOff
+}
+
 func (c Config) Validate() error {
 	if strings.TrimSpace(c.HomeserverURL) == "" {
 		return errors.New("homeserver URL is required")
@@ -140,6 +151,9 @@ func (c Config) Validate() error {
 	}
 	if c.Theme != "" && c.Theme != ThemeMinimal && c.Theme != ThemeBoxed {
 		return fmt.Errorf("invalid theme %q (use %q or %q)", c.Theme, ThemeMinimal, ThemeBoxed)
+	}
+	if c.Reactions != "" && c.Reactions != ReactionsOff && c.Reactions != ReactionsLimited && c.Reactions != ReactionsFull {
+		return fmt.Errorf("invalid reactions setting %q (use %q, %q or %q)", c.Reactions, ReactionsOff, ReactionsLimited, ReactionsFull)
 	}
 	if err := c.validateKeybindings(); err != nil {
 		return err

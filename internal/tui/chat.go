@@ -18,8 +18,8 @@ import (
 )
 
 type incomingMsg struct {
-	message matrix.Message
-	ok      bool
+	event matrix.TimelineEvent
+	ok    bool
 }
 type streamErrMsg struct{ err error }
 type sentMsg struct {
@@ -115,7 +115,7 @@ type chatModel struct {
 	ctx              context.Context
 	client           matrix.API
 	keys             config.Config
-	incoming         <-chan matrix.Message
+	incoming         <-chan matrix.TimelineEvent
 	errors           <-chan error
 	input            textinput.Model
 	view             viewport.Model
@@ -135,6 +135,7 @@ type chatModel struct {
 	currentRoom          string
 	roomInfo             matrix.RoomInfo
 	messages             map[string][]matrix.Message
+	reactions            map[string]map[string][]matrix.Reaction
 	delivery             map[string]deliveryState
 	localMessageSequence int
 	nextPage             map[string]string
@@ -199,7 +200,7 @@ func run(ctx context.Context, client matrix.API, initialRoom string, cfg config.
 	model := &chatModel{
 		ctx: ctx, client: client, keys: cfg, incoming: incoming, errors: errs,
 		input: input, view: viewport.New(80, 20), threadView: viewport.New(40, 20), navView: viewport.New(80, 20), navigatorLoading: true,
-		messages: make(map[string][]matrix.Message), delivery: make(map[string]deliveryState), nextPage: make(map[string]string),
+		messages: make(map[string][]matrix.Message), reactions: make(map[string]map[string][]matrix.Reaction), delivery: make(map[string]deliveryState), nextPage: make(map[string]string),
 		loadingOlder: make(map[string]bool), unread: make(map[string]int), navigator: initialRoom == "",
 		accountName: switcher.Current, accountColor: cfg.Color, accounts: switcher.Accounts, setDefaultAccount: switcher.SetDefault,
 		accountNotifications: switcher.Notifications, accountUnread: make(map[string]int),
@@ -247,8 +248,8 @@ func (m *chatModel) Init() tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
-func waitIncoming(ch <-chan matrix.Message) tea.Cmd {
-	return func() tea.Msg { msg, ok := <-ch; return incomingMsg{message: msg, ok: ok} }
+func waitIncoming(ch <-chan matrix.TimelineEvent) tea.Cmd {
+	return func() tea.Msg { event, ok := <-ch; return incomingMsg{event: event, ok: ok} }
 }
 
 func waitAccountNotification(ch <-chan AccountNotification) tea.Cmd {
@@ -332,6 +333,7 @@ func (m *chatModel) fetchHistory(room, from string) (matrix.MessagePage, error) 
 			return matrix.MessagePage{}, err
 		}
 		result.Messages = mergeMessages(page.Messages, result.Messages)
+		result.Reactions = append(result.Reactions, page.Reactions...)
 		result.Next = page.Next
 		if page.Next == "" || page.Next == previous {
 			break
@@ -521,20 +523,31 @@ func (m *chatModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case incomingMsg:
 		if msg.ok {
-			m.storeIncoming(msg.message)
-			visibleHere := msg.message.RoomID == m.currentRoom && !m.navigator
-			if m.thread == "" && msg.message.ThreadRoot != "" {
+			if msg.event.Reaction != nil {
+				m.storeReaction(*msg.event.Reaction)
+				if msg.event.Reaction.RoomID == m.currentRoom && !m.navigator {
+					m.refreshView()
+				}
+				return m, waitIncoming(m.incoming)
+			}
+			if msg.event.Message == nil {
+				return m, waitIncoming(m.incoming)
+			}
+			message := *msg.event.Message
+			m.storeIncoming(message)
+			visibleHere := message.RoomID == m.currentRoom && !m.navigator
+			if m.thread == "" && message.ThreadRoot != "" {
 				visibleHere = false
-			} else if m.thread != "" && msg.message.EventID != m.thread && msg.message.ThreadRoot != m.thread {
+			} else if m.thread != "" && message.EventID != m.thread && message.ThreadRoot != m.thread {
 				visibleHere = false
 			}
 			if visibleHere {
 				m.selection = max(0, len(m.visibleMessages())-1)
 				m.refreshView()
 			} else {
-				m.unread[msg.message.RoomID]++
-				if msg.message.Sender != m.currentUserID {
-					m.addNotification(AccountNotification{Account: m.accountName, Color: m.accountColor, RoomName: m.roomName(msg.message.RoomID), Message: msg.message})
+				m.unread[message.RoomID]++
+				if message.Sender != m.currentUserID {
+					m.addNotification(AccountNotification{Account: m.accountName, Color: m.accountColor, RoomName: m.roomName(message.RoomID), Message: message})
 				}
 			}
 			return m, waitIncoming(m.incoming)
@@ -609,6 +622,7 @@ func (m *chatModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 		// selection lands on what used to be the newest message. Only retain live
 		// events that arrived while this history request was in flight.
 		m.messages[msg.info.ID] = replaceWithRecentMessages(msg.page.Messages, m.messages[msg.info.ID], msg.previousEvents)
+		m.storeReactions(msg.page.Reactions)
 		m.nextPage[msg.info.ID] = msg.page.Next
 		m.thread = ""
 		m.rootSelection = 0
@@ -632,6 +646,7 @@ func (m *chatModel) Update(raw tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		before := len(m.messages[msg.room])
 		m.messages[msg.room] = mergeMessages(msg.page.Messages, m.messages[msg.room])
+		m.storeReactions(msg.page.Reactions)
 		m.nextPage[msg.room] = msg.page.Next
 		if msg.room == m.currentRoom {
 			m.selection += len(m.messages[msg.room]) - before
@@ -868,6 +883,32 @@ func (m *chatModel) storeIncoming(message matrix.Message) {
 	m.messages[message.RoomID] = append(messages, message)
 }
 
+func (m *chatModel) storeReactions(reactions []matrix.Reaction) {
+	for _, reaction := range reactions {
+		m.storeReaction(reaction)
+	}
+}
+
+func (m *chatModel) storeReaction(reaction matrix.Reaction) {
+	if reaction.RoomID == "" || reaction.TargetEventID == "" || reaction.Key == "" || m.keys.EffectiveReactions() == config.ReactionsOff {
+		return
+	}
+	if m.reactions == nil {
+		m.reactions = make(map[string]map[string][]matrix.Reaction)
+	}
+	byTarget := m.reactions[reaction.RoomID]
+	if byTarget == nil {
+		byTarget = make(map[string][]matrix.Reaction)
+		m.reactions[reaction.RoomID] = byTarget
+	}
+	for _, existing := range byTarget[reaction.TargetEventID] {
+		if reaction.EventID != "" && existing.EventID == reaction.EventID {
+			return
+		}
+	}
+	byTarget[reaction.TargetEventID] = append(byTarget[reaction.TargetEventID], reaction)
+}
+
 func mergeMessages(first, second []matrix.Message) []matrix.Message {
 	merged := make([]matrix.Message, 0, len(first)+len(second))
 	seen := make(map[string]bool, len(first)+len(second))
@@ -1000,7 +1041,7 @@ func wrapMessageBody(body string, width int) []string {
 	return strings.Split(body, "\n")
 }
 
-func renderMessages(messages []matrix.Message, delivery map[string]deliveryState, selected int, active bool, width int) string {
+func renderMessages(messages []matrix.Message, reactions map[string][]matrix.Reaction, reactionMode string, delivery map[string]deliveryState, selected int, active bool, width int) string {
 	lines := make([]string, 0, len(messages))
 	for i, msg := range messages {
 		stamp := "     "
@@ -1047,6 +1088,9 @@ func renderMessages(messages []matrix.Message, delivery map[string]deliveryState
 				}
 			}
 		}
+		if summary := reactionSummary(msg.ReactionCounts, reactions[msg.EventID], reactionMode); summary != "" {
+			msgLines = append(msgLines, dimStyle.Render("  "+summary))
+		}
 		text := strings.Join(msgLines, "\n")
 		line := indentBlock(text, "  ")
 		if i == selected {
@@ -1055,6 +1099,44 @@ func renderMessages(messages []matrix.Message, delivery map[string]deliveryState
 		lines = append(lines, line)
 	}
 	return strings.Join(lines, "\n")
+}
+
+func reactionSummary(counts map[string]int, reactions []matrix.Reaction, mode string) string {
+	if mode == config.ReactionsOff || (len(counts) == 0 && len(reactions) == 0) {
+		return ""
+	}
+	if len(counts) == 0 {
+		counts = make(map[string]int)
+		for _, reaction := range reactions {
+			counts[reaction.Key]++
+		}
+	}
+	type summary struct {
+		key   string
+		count int
+	}
+	entries := make([]summary, 0, len(counts))
+	for key, count := range counts {
+		entries = append(entries, summary{key: key, count: count})
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].count == entries[j].count {
+			return entries[i].key < entries[j].key
+		}
+		return entries[i].count > entries[j].count
+	})
+	if mode == config.ReactionsLimited && len(entries) > 3 {
+		entries = entries[:3]
+	}
+	parts := make([]string, len(entries))
+	for i, entry := range entries {
+		parts[i] = fmt.Sprintf("%s %d", entry.key, entry.count)
+	}
+	return strings.Join(parts, "  ")
+}
+
+func (m *chatModel) roomReactions() map[string][]matrix.Reaction {
+	return m.reactions[m.currentRoom]
 }
 
 func (m *chatModel) refreshView() {
@@ -1067,7 +1149,7 @@ func (m *chatModel) refreshView() {
 		}
 		m.view.Width = max(20, m.width-6)
 		m.view.Height = max(3, m.height-9)
-		m.view.SetContent(renderMessages(main, m.delivery, m.selection, m.mode == normalMode, m.view.Width))
+		m.view.SetContent(renderMessages(main, m.roomReactions(), m.keys.EffectiveReactions(), m.delivery, m.selection, m.mode == normalMode, m.view.Width))
 		m.view.GotoBottom()
 		return
 	}
@@ -1080,7 +1162,7 @@ func (m *chatModel) refreshView() {
 	if m.keys.EffectiveThreadView() == config.ThreadViewFocused {
 		m.view.Width = max(20, m.width-6)
 		m.view.Height = max(3, m.height-9)
-		m.view.SetContent(renderMessages(thread, m.delivery, m.selection, m.mode == normalMode, m.view.Width))
+		m.view.SetContent(renderMessages(thread, m.roomReactions(), m.keys.EffectiveReactions(), m.delivery, m.selection, m.mode == normalMode, m.view.Width))
 		m.view.GotoBottom()
 		return
 	}
@@ -1100,8 +1182,8 @@ func (m *chatModel) refreshView() {
 	}
 	m.view.Width = max(16, columnWidth-4)
 	m.threadView.Width = max(16, columnWidth-4)
-	m.view.SetContent(renderMessages(main, m.delivery, m.rootSelection, false, m.view.Width))
-	m.threadView.SetContent(renderMessages(thread, m.delivery, m.selection, m.mode == normalMode, m.threadView.Width))
+	m.view.SetContent(renderMessages(main, m.roomReactions(), m.keys.EffectiveReactions(), m.delivery, m.rootSelection, false, m.view.Width))
+	m.threadView.SetContent(renderMessages(thread, m.roomReactions(), m.keys.EffectiveReactions(), m.delivery, m.selection, m.mode == normalMode, m.threadView.Width))
 	m.view.GotoBottom()
 	m.threadView.GotoBottom()
 }

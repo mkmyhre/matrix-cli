@@ -285,9 +285,9 @@ func TestSubscribeSkipsInitialTimeline(t *testing.T) {
 	defer cancel()
 	messages, errs := client.Subscribe(ctx, "!room:test")
 	select {
-	case msg := <-messages:
-		if msg.Body != "new" {
-			t.Fatalf("received %q, expected initial event to be skipped", msg.Body)
+	case received := <-messages:
+		if received.Message == nil || received.Message.Body != "new" {
+			t.Fatalf("received %#v, expected initial event to be skipped", received)
 		}
 		cancel()
 	case err := <-errs:
@@ -354,6 +354,28 @@ func TestMessageFromEventIncludesThreadRoot(t *testing.T) {
 	got, ok := MessageFromEvent(evt)
 	if !ok || got.ThreadRoot != "$root" {
 		t.Fatalf("thread root = %q, ok = %v", got.ThreadRoot, ok)
+	}
+}
+
+func TestMessageFromEventIncludesAggregatedReactions(t *testing.T) {
+	evt := &event.Event{
+		Type: event.EventMessage, RoomID: id.RoomID("!room:test"), ID: id.EventID("$event"),
+		Content:  event.Content{Parsed: &event.MessageEventContent{MsgType: event.MsgText, Body: "hello"}},
+		Unsigned: event.Unsigned{Relations: &event.Relations{Annotations: event.AnnotationChunk{Map: map[string]int{"👍": 2, "❤️": 1}}}},
+	}
+	got, ok := MessageFromEvent(evt)
+	if !ok || got.ReactionCounts["👍"] != 2 || got.ReactionCounts["❤️"] != 1 {
+		t.Fatalf("message = %#v, ok = %v", got, ok)
+	}
+}
+
+func TestReactionFromEvent(t *testing.T) {
+	relation := event.RelatesTo{}
+	relation.SetAnnotation(id.EventID("$message"), "👍")
+	evt := &event.Event{Type: event.EventReaction, RoomID: id.RoomID("!room:test"), Sender: id.UserID("@alice:test"), ID: id.EventID("$reaction"), Timestamp: 1234, Content: event.Content{Parsed: &event.ReactionEventContent{RelatesTo: relation}}}
+	got, ok := ReactionFromEvent(evt)
+	if !ok || got.RoomID != "!room:test" || got.TargetEventID != "$message" || got.Key != "👍" || got.EventID != "$reaction" {
+		t.Fatalf("reaction = %#v, ok = %v", got, ok)
 	}
 }
 

@@ -120,7 +120,7 @@ func (a *App) Root() *cobra.Command {
 	}
 	root.PersistentFlags().StringVar(&account, "ac", account, "account to use")
 	root.PersistentFlags().StringVar(&account, "account", account, "account to use (same as --ac)")
-	root.AddCommand(a.loginCommand(), a.logoutCommand(), a.roomsCommand(), a.spacesCommand(), a.sendCommand(), a.watchCommand(), a.chatCommand(), a.tuiCommand(), a.keysCommand(), a.configCommand(), a.accountsCommand(), a.verifyCommand())
+	root.AddCommand(a.loginCommand(), a.logoutCommand(), a.roomsCommand(), a.spacesCommand(), a.sendCommand(), a.reactCommand(), a.watchCommand(), a.chatCommand(), a.tuiCommand(), a.keysCommand(), a.configCommand(), a.accountsCommand(), a.verifyCommand())
 	return root
 }
 
@@ -686,6 +686,7 @@ func (a *App) configCommand() *cobra.Command {
 		}
 		fmt.Fprintf(cmd.OutOrStdout(), "color\t%s\n", color)
 		fmt.Fprintf(cmd.OutOrStdout(), "theme\t%s\n", cfg.EffectiveTheme())
+		fmt.Fprintf(cmd.OutOrStdout(), "reactions\t%s\n", cfg.EffectiveReactions())
 		return nil
 	}}
 	cmd.AddCommand(&cobra.Command{Use: "set <setting> <value>", Short: "Change an account setting", Args: cobra.ExactArgs(2), RunE: func(cmd *cobra.Command, args []string) error {
@@ -713,6 +714,11 @@ func (a *App) configCommand() *cobra.Command {
 				return fmt.Errorf("invalid theme %q (use %q or %q)", value, config.ThemeMinimal, config.ThemeBoxed)
 			}
 			cfg.Theme = value
+		case "reactions":
+			if value != config.ReactionsOff && value != config.ReactionsLimited && value != config.ReactionsFull {
+				return fmt.Errorf("invalid reactions setting %q (use %q, %q or %q)", value, config.ReactionsOff, config.ReactionsLimited, config.ReactionsFull)
+			}
+			cfg.Reactions = value
 		default:
 			return fmt.Errorf("unknown config setting %q", setting)
 		}
@@ -765,6 +771,17 @@ func (a *App) sendCommand() *cobra.Command {
 	}}
 }
 
+func (a *App) reactCommand() *cobra.Command {
+	return &cobra.Command{Use: "react <room> <event-id> <key>", Short: "Add a reaction to a message", Args: cobra.ExactArgs(3), RunE: func(cmd *cobra.Command, args []string) error {
+		client, err := a.loadClient(cmd.Context())
+		if err != nil {
+			return err
+		}
+		_, err = client.SendReaction(cmd.Context(), args[0], args[1], args[2])
+		return err
+	}}
+}
+
 func (a *App) watchCommand() *cobra.Command {
 	return &cobra.Command{Use: "watch [room]", Short: "Stream new messages", Args: cobra.MaximumNArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		client, err := a.loadClient(cmd.Context())
@@ -778,12 +795,14 @@ func (a *App) watchCommand() *cobra.Command {
 		messages, errs := client.Subscribe(cmd.Context(), room)
 		for messages != nil || errs != nil {
 			select {
-			case msg, ok := <-messages:
+			case event, ok := <-messages:
 				if !ok {
 					messages = nil
 					continue
 				}
-				fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%s\n", msg.RoomID, msg.Sender, msg.Body)
+				if event.Message != nil {
+					fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%s\n", event.Message.RoomID, event.Message.Sender, event.Message.Body)
+				}
 			case syncErr, ok := <-errs:
 				if !ok {
 					errs = nil
@@ -899,12 +918,15 @@ func startTUIAccountNotifications(ctx context.Context, options []tui.AccountOpti
 			}
 			for messages != nil || errs != nil {
 				select {
-				case message, ok := <-messages:
+				case event, ok := <-messages:
 					if !ok {
 						messages = nil
 						continue
 					}
-					notification := tui.AccountNotification{Account: name, Color: accountColor, RoomName: roomNames[message.RoomID], Message: message}
+					if event.Message == nil {
+						continue
+					}
+					notification := tui.AccountNotification{Account: name, Color: accountColor, RoomName: roomNames[event.Message.RoomID], Message: *event.Message}
 					select {
 					case notifications <- notification:
 					case <-ctx.Done():
