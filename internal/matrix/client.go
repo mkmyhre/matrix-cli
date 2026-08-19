@@ -33,17 +33,33 @@ type RoomInfo struct {
 }
 
 type MessagePage struct {
-	Messages []Message
-	Next     string
+	Messages  []Message
+	Reactions []Reaction
+	Next      string
 }
 
 type Message struct {
-	RoomID     string
-	Sender     string
-	Body       string
-	EventID    string
-	ThreadRoot string
-	Timestamp  time.Time
+	RoomID         string
+	Sender         string
+	Body           string
+	EventID        string
+	ThreadRoot     string
+	Timestamp      time.Time
+	ReactionCounts map[string]int
+}
+
+type Reaction struct {
+	RoomID        string
+	TargetEventID string
+	Key           string
+	Sender        string
+	EventID       string
+	Timestamp     time.Time
+}
+
+type TimelineEvent struct {
+	Message  *Message
+	Reaction *Reaction
 }
 
 type API interface {
@@ -53,7 +69,8 @@ type API interface {
 	RecentMessages(context.Context, string, string, int) (MessagePage, error)
 	Send(context.Context, string, string) (string, error)
 	SendThread(context.Context, string, string, string) (string, error)
-	Subscribe(context.Context, string) (<-chan Message, <-chan error)
+	SendReaction(context.Context, string, string, string) (string, error)
+	Subscribe(context.Context, string) (<-chan TimelineEvent, <-chan error)
 	Logout(context.Context) error
 }
 
@@ -363,6 +380,23 @@ func (c *Client) SendThread(ctx context.Context, room, rootEventID, body string)
 	return response.EventID.String(), nil
 }
 
+func (c *Client) SendReaction(ctx context.Context, room, eventID, key string) (string, error) {
+	roomID, err := c.resolveRoom(ctx, room)
+	if err != nil {
+		return "", err
+	}
+	if err = c.prepareRoomEncryption(ctx, roomID); err != nil {
+		return "", err
+	}
+	content := &event.ReactionEventContent{RelatesTo: event.RelatesTo{}}
+	content.RelatesTo.SetAnnotation(id.EventID(eventID), key)
+	response, err := c.raw.SendMessageEvent(ctx, roomID, event.EventReaction, content)
+	if err != nil {
+		return "", err
+	}
+	return response.EventID.String(), nil
+}
+
 func (c *Client) RecentMessages(ctx context.Context, room, from string, limit int) (MessagePage, error) {
 	roomID, err := c.resolveRoom(ctx, room)
 	if err != nil {
@@ -372,7 +406,7 @@ func (c *Client) RecentMessages(ctx context.Context, room, from string, limit in
 	if err != nil {
 		return MessagePage{}, err
 	}
-	page := MessagePage{Messages: make([]Message, 0, len(resp.Chunk)), Next: resp.End}
+	page := MessagePage{Messages: make([]Message, 0, len(resp.Chunk)), Reactions: make([]Reaction, 0), Next: resp.End}
 	for i := len(resp.Chunk) - 1; i >= 0; i-- {
 		evt := resp.Chunk[i]
 		if evt.Type == event.EventEncrypted {
@@ -403,8 +437,23 @@ func (c *Client) RecentMessages(ctx context.Context, room, from string, limit in
 		}
 		if msg, ok := MessageFromEvent(evt); ok {
 			page.Messages = append(page.Messages, msg)
+		} else if reaction, ok := ReactionFromEvent(evt); ok {
+			page.Reactions = append(page.Reactions, reaction)
 		}
 	}
+	aggregated := make(map[string]bool)
+	for _, message := range page.Messages {
+		if len(message.ReactionCounts) > 0 {
+			aggregated[message.EventID] = true
+		}
+	}
+	reactions := page.Reactions[:0]
+	for _, reaction := range page.Reactions {
+		if !aggregated[reaction.TargetEventID] {
+			reactions = append(reactions, reaction)
+		}
+	}
+	page.Reactions = reactions
 	return page, nil
 }
 
@@ -425,12 +474,12 @@ func undecryptableMessage(evt *event.Event) Message {
 // Subscribe emits new plain-text room messages. Events from the initial sync are
 // skipped, so callers receive a live stream rather than recent history.
 // An empty room subscribes to all joined rooms.
-func (c *Client) Subscribe(ctx context.Context, room string) (<-chan Message, <-chan error) {
-	messages := make(chan Message, 64)
+func (c *Client) Subscribe(ctx context.Context, room string) (<-chan TimelineEvent, <-chan error) {
+	events := make(chan TimelineEvent, 64)
 	errs := make(chan error, 1)
 
 	go func() {
-		defer close(messages)
+		defer close(events)
 		defer close(errs)
 
 		var wanted id.RoomID
@@ -459,7 +508,21 @@ func (c *Client) Subscribe(ctx context.Context, room string) (<-chan Message, <-
 				return
 			}
 			select {
-			case messages <- msg:
+			case events <- TimelineEvent{Message: &msg}:
+			case <-ctx.Done():
+			}
+		})
+		syncer.OnEventType(event.EventReaction, func(eventCtx context.Context, evt *event.Event) {
+			since, _ := eventCtx.Value(mautrix.SyncTokenContextKey).(string)
+			if since == "" || (wanted != "" && evt.RoomID != wanted) {
+				return
+			}
+			reaction, ok := ReactionFromEvent(evt)
+			if !ok {
+				return
+			}
+			select {
+			case events <- TimelineEvent{Reaction: &reaction}:
 			case <-ctx.Done():
 			}
 		})
@@ -470,7 +533,7 @@ func (c *Client) Subscribe(ctx context.Context, room string) (<-chan Message, <-
 			errs <- err
 		}
 	}()
-	return messages, errs
+	return events, errs
 }
 
 func MessageFromEvent(evt *event.Event) (Message, bool) {
@@ -493,6 +556,12 @@ func MessageFromEvent(evt *event.Event) (Message, bool) {
 		return Message{}, false
 	}
 	msg := Message{RoomID: evt.RoomID.String(), Sender: evt.Sender.String(), Body: content.Body, EventID: evt.ID.String()}
+	if evt.Unsigned.Relations != nil && len(evt.Unsigned.Relations.Annotations.Map) > 0 {
+		msg.ReactionCounts = make(map[string]int, len(evt.Unsigned.Relations.Annotations.Map))
+		for key, count := range evt.Unsigned.Relations.Annotations.Map {
+			msg.ReactionCounts[key] = count
+		}
+	}
 	if content.RelatesTo != nil {
 		msg.ThreadRoot = content.RelatesTo.GetThreadParent().String()
 	}
@@ -500,6 +569,29 @@ func MessageFromEvent(evt *event.Event) (Message, bool) {
 		msg.Timestamp = time.UnixMilli(evt.Timestamp)
 	}
 	return msg, true
+}
+
+func ReactionFromEvent(evt *event.Event) (Reaction, bool) {
+	if evt == nil || evt.Type != event.EventReaction {
+		return Reaction{}, false
+	}
+	if evt.Content.Parsed == nil {
+		if len(evt.Content.VeryRaw) == 0 && evt.Content.Raw != nil {
+			evt.Content.VeryRaw, _ = json.Marshal(evt.Content.Raw)
+		}
+		if err := evt.Content.ParseRaw(evt.Type); err != nil {
+			return Reaction{}, false
+		}
+	}
+	content := evt.Content.AsReaction()
+	if content.RelatesTo.GetAnnotationID() == "" || content.RelatesTo.GetAnnotationKey() == "" {
+		return Reaction{}, false
+	}
+	reaction := Reaction{RoomID: evt.RoomID.String(), TargetEventID: content.RelatesTo.GetAnnotationID().String(), Key: content.RelatesTo.GetAnnotationKey(), Sender: evt.Sender.String(), EventID: evt.ID.String()}
+	if evt.Timestamp > 0 {
+		reaction.Timestamp = time.UnixMilli(evt.Timestamp)
+	}
+	return reaction, true
 }
 
 // Verify starts SAS verification with another device belonging to the logged-in user.

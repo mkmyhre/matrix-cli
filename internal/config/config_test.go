@@ -85,6 +85,16 @@ func TestThreadViewDefaultsToFocusedAndValidates(t *testing.T) {
 	if got := (Config{Theme: ThemeBoxed}).EffectiveTheme(); got != ThemeBoxed {
 		t.Fatalf("configured theme = %q", got)
 	}
+	if got := (Config{}).EffectiveReactions(); got != ReactionsOff {
+		t.Fatalf("default reactions = %q", got)
+	}
+	if got := (Config{Reactions: ReactionsLimited}).EffectiveReactions(); got != ReactionsLimited {
+		t.Fatalf("configured reactions = %q", got)
+	}
+	cfg.Reactions = "icons"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("invalid reactions setting was accepted")
+	}
 }
 
 func TestConfigValidatesBaseURLs(t *testing.T) {

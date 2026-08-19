@@ -110,7 +110,7 @@ func (s *failOnceDeleteSession) Delete() error {
 type fakeMatrix struct {
 	sentRoom, sentBody string
 	rooms              []matrix.Room
-	messages           <-chan matrix.Message
+	messages           <-chan matrix.TimelineEvent
 	streamErrors       <-chan error
 }
 
@@ -130,7 +130,11 @@ func (f *fakeMatrix) SendThread(_ context.Context, room, _ string, body string) 
 	f.sentRoom, f.sentBody = room, body
 	return "$sent", nil
 }
-func (f *fakeMatrix) Subscribe(context.Context, string) (<-chan matrix.Message, <-chan error) {
+func (f *fakeMatrix) SendReaction(_ context.Context, room, eventID, key string) (string, error) {
+	f.sentRoom, f.sentBody = room, eventID+":"+key
+	return "$reaction", nil
+}
+func (f *fakeMatrix) Subscribe(context.Context, string) (<-chan matrix.TimelineEvent, <-chan error) {
 	if f.messages != nil || f.streamErrors != nil {
 		return f.messages, f.streamErrors
 	}
@@ -145,8 +149,12 @@ type validatingMatrix struct {
 
 func (f *validatingMatrix) ValidateSession(context.Context) error { return f.err }
 
-func closedMessages() <-chan matrix.Message { ch := make(chan matrix.Message); close(ch); return ch }
-func closedErrors() <-chan error            { ch := make(chan error); close(ch); return ch }
+func closedMessages() <-chan matrix.TimelineEvent {
+	ch := make(chan matrix.TimelineEvent)
+	close(ch)
+	return ch
+}
+func closedErrors() <-chan error { ch := make(chan error); close(ch); return ch }
 
 func testApp(fake *fakeMatrix) *App {
 	cfg := &memoryConfig{value: config.Config{HomeserverURL: "https://hs", AuthURL: "https://auth", Username: "alice"}, present: true}
@@ -181,6 +189,18 @@ func TestSendCommandJoinsMessageArguments(t *testing.T) {
 	}
 	if fake.sentRoom != "!room:test" || fake.sentBody != "hello world" {
 		t.Fatalf("sent %q to %q", fake.sentBody, fake.sentRoom)
+	}
+}
+
+func TestReactCommandSendsReaction(t *testing.T) {
+	fake := &fakeMatrix{}
+	root := testApp(fake).Root()
+	root.SetArgs([]string{"react", "!room:test", "$message", "👍"})
+	if err := root.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if fake.sentRoom != "!room:test" || fake.sentBody != "$message:👍" {
+		t.Fatalf("reaction %q in %q", fake.sentBody, fake.sentRoom)
 	}
 }
 
@@ -405,8 +425,9 @@ func TestAccountsDefaultPersistsPreference(t *testing.T) {
 }
 
 func TestPrepareTUIAccountsKeepsBackgroundAccountsLive(t *testing.T) {
-	prodMessages := make(chan matrix.Message, 1)
-	prodMessages <- matrix.Message{RoomID: "!incident:prod", Sender: "@alice:prod", Body: "failed"}
+	prodMessages := make(chan matrix.TimelineEvent, 1)
+	message := matrix.Message{RoomID: "!incident:prod", Sender: "@alice:prod", Body: "failed"}
+	prodMessages <- matrix.TimelineEvent{Message: &message}
 	close(prodMessages)
 	clients := map[string]*fakeMatrix{
 		"dev":  {},

@@ -205,6 +205,7 @@ matrix [--ac <name>] verify
 matrix rooms
 matrix spaces
 matrix send <room-id-or-alias> <message>
+matrix react <room-id-or-alias> <event-id> <key>
 matrix watch [room-id-or-alias]
 matrix chat <room-id-or-alias>
 matrix tui
@@ -214,6 +215,7 @@ matrix config
 matrix config set thread_view <focused|split>
 matrix [--ac <name>] config set color <#RRGGBB|default>
 matrix [--ac <name>] config set theme <minimal|boxed>
+matrix [--ac <name>] config set reactions <off|limited|full>
 ```
 
 ## Chat controls
@@ -291,6 +293,15 @@ matrix --ac personal config set thread_view split
 
 Use `focused` to switch back. The navigator marks unread rooms, and messages use
 local timestamps with shortened sender names.
+
+Reactions are hidden by default. Set `reactions` to `limited` to show the three
+most-used reaction keys below each message, or `full` to show every key:
+
+```sh
+matrix --ac personal config set reactions limited
+matrix --ac personal react '!room:example.org' '$event' '👍'
+```
+
 `matrix spaces` prints the joined space hierarchy using names where possible.
 
 `watch` and `chat` use Matrix `/sync` and only display live events after the
